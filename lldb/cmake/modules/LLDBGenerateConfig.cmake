@@ -19,6 +19,28 @@ check_cxx_symbol_exists(__NR_process_vm_readv "sys/syscall.h" HAVE_NR_PROCESS_VM
 
 check_library_exists(compression compression_encode_buffer "" HAVE_LIBCOMPRESSION)
 
+# When the system libcompression isn't available (i.e. anywhere outside Apple
+# platforms) fall back to our portable vendored implementation under
+# third-party/libcompression.  It provides LZ4 / LZ4_RAW / LZFSE / ZLIB; the
+# LZMA path is stubbed (returns failure) and lldb's gdb-remote layer simply
+# falls back to an uncompressed packet in that case.
+set(LLDB_LIBCOMPRESSION_TARGET "")
+if(HAVE_LIBCOMPRESSION)
+  set(LLDB_LIBCOMPRESSION_TARGET compression)
+else()
+  set(_lldb_vendored_libcompression
+      "${LLVM_MAIN_SRC_DIR}/../third-party/libcompression")
+  if(EXISTS "${_lldb_vendored_libcompression}/CMakeLists.txt")
+    if(NOT TARGET libcompression)
+      add_subdirectory("${_lldb_vendored_libcompression}"
+                       "${CMAKE_BINARY_DIR}/third-party/libcompression"
+                       EXCLUDE_FROM_ALL)
+    endif()
+    set(HAVE_LIBCOMPRESSION 1)
+    set(LLDB_LIBCOMPRESSION_TARGET libcompression)
+  endif()
+endif()
+
 set(LLDB_INSTALL_LIBDIR_BASENAME "lib${LLDB_LIBDIR_SUFFIX}")
 
 # These checks exist in LLVM's configuration, so I want to match the LLVM names
