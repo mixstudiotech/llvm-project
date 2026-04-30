@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>12.0</LangVersion>
+    <DebugHostSchema>$(MSBuildProjectDirectory)\..\..\..\schema\DebugHostCore.td</DebugHostSchema>
+    <DtxCodegenExe Condition="'$(DtxCodegenExe)' == ''">$(MSBuildProjectDirectory)\..\..\..\..\.build\x64\bin\dtx-codegen.exe</DtxCodegenExe>
+    <GeneratedDir Condition="'$(GeneratedDir)' == ''">$(MSBuildProjectDirectory)\obj\generated-debughost</GeneratedDir>
+    <GenerateDebugHostClient Condition="'$(GenerateDebugHostClient)' == ''">true</GenerateDebugHostClient>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\runtime\csharp\src\Dtx\Dtx.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="bin\**\*.cs;obj\**\*.cs;generated-debughost\**\*.cs;$(GeneratedDir)\**\*.cs" />
+    <Compile Include="$(GeneratedDir)\DebugHostTypes.g.cs" Link="Generated\DebugHostTypes.g.cs" />
+    <Compile Include="$(GeneratedDir)\DebugHostClient.g.cs" Link="Generated\DebugHostClient.g.cs" />
+  </ItemGroup>
+
+  <Target Name="GenerateDebugHostClient"
+          BeforeTargets="BeforeCompile"
+          Condition="'$(GenerateDebugHostClient)' == 'true'">
+    <Error Condition="!Exists('$(DtxCodegenExe)')"
+           Text="dtx-codegen was not found at '$(DtxCodegenExe)'. Pass -p:DtxCodegenExe=&lt;path&gt; or build ycode-debughost first." />
+    <MakeDir Directories="$(GeneratedDir)" />
+    <Exec Command="&quot;$(DtxCodegenExe)&quot; --input &quot;$(DebugHostSchema)&quot; --lang csharp --out-dir &quot;$(GeneratedDir)&quot;" />
+  </Target>
+</Project>

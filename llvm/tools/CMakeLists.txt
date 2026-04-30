@@ -48,6 +48,7 @@ add_llvm_external_project(mlir)
 # accordingly so place them afterwards
 add_llvm_external_project(clang)
 add_llvm_external_project(flang)
+add_llvm_external_project(dtx)
 add_llvm_external_project(lldb)
 add_llvm_external_project(bolt)
 

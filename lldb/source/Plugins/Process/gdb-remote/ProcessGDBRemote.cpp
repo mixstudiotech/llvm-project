@@ -33,6 +33,7 @@
 #include "lldb/Core/Value.h"
 #include "lldb/DataFormatters/FormatManager.h"
 #include "lldb/Host/ConnectionFileDescriptor.h"
+#include "lldb/Host/ConnectionRemoteIOS.h"
 #include "lldb/Host/FileSystem.h"
 #include "lldb/Host/HostInfo.h"
 #include "lldb/Host/HostThread.h"
@@ -179,6 +180,11 @@ public:
 };
 
 std::chrono::seconds ResumeTimeout() { return std::chrono::seconds(5); }
+
+bool IsMixDeviceConnectURL(llvm::StringRef URL) {
+  return URL.starts_with("ios://") || URL.starts_with("android://") ||
+         URL.starts_with("mix-ios://") || URL.starts_with("mix-android://");
+}
 
 } // namespace
 
@@ -881,8 +887,11 @@ Status ProcessGDBRemote::ConnectToDebugserver(llvm::StringRef connect_url) {
   if (!connect_url.empty()) {
     LLDB_LOGF(log, "ProcessGDBRemote::%s Connecting to %s", __FUNCTION__,
               connect_url.str().c_str());
-    std::unique_ptr<ConnectionFileDescriptor> conn_up(
-        new ConnectionFileDescriptor());
+    std::unique_ptr<Connection> conn_up;
+    if (IsMixDeviceConnectURL(connect_url))
+      conn_up = std::make_unique<ConnectionRemoteIOS>();
+    else
+      conn_up = std::make_unique<ConnectionFileDescriptor>();
     if (conn_up) {
       const uint32_t max_retry_count = 50;
       uint32_t retry_count = 0;

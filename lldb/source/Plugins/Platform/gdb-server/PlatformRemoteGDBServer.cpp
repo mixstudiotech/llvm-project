@@ -16,6 +16,7 @@
 #include "lldb/Core/ModuleSpec.h"
 #include "lldb/Core/PluginManager.h"
 #include "lldb/Host/ConnectionFileDescriptor.h"
+#include "lldb/Host/ConnectionRemoteIOS.h"
 #include "lldb/Host/Host.h"
 #include "lldb/Host/HostInfo.h"
 #include "lldb/Host/PosixApi.h"
@@ -48,6 +49,11 @@ static bool g_initialized = false;
 // from the remote, these strings need persistent storage client-side.
 static std::mutex g_signal_string_mutex;
 static llvm::StringSet<> g_signal_string_storage;
+
+static bool IsMixDeviceConnectURL(llvm::StringRef URL) {
+  return URL.starts_with("ios://") || URL.starts_with("android://") ||
+         URL.starts_with("mix-ios://") || URL.starts_with("mix-android://");
+}
 
 void PlatformRemoteGDBServer::Initialize() {
   Platform::Initialize();
@@ -238,7 +244,10 @@ Status PlatformRemoteGDBServer::ConnectRemote(Args &args) {
       std::make_unique<process_gdb_remote::GDBRemoteCommunicationClient>();
   client_up->SetPacketTimeout(
       process_gdb_remote::ProcessGDBRemote::GetPacketTimeout());
-  client_up->SetConnection(std::make_unique<ConnectionFileDescriptor>());
+  if (IsMixDeviceConnectURL(url))
+    client_up->SetConnection(std::make_unique<ConnectionRemoteIOS>());
+  else
+    client_up->SetConnection(std::make_unique<ConnectionFileDescriptor>());
   client_up->Connect(url, &error);
 
   if (error.Fail())

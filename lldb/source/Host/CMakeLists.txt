@@ -17,6 +17,7 @@ macro(add_host_subdirectory group)
 endmacro()
 
 add_host_subdirectory(common
+  common/ConnectionRemoteIOS.cpp
   common/DiagnosticsRendering.cpp
   common/FileAction.cpp
   common/FileCache.cpp
@@ -151,6 +152,18 @@ else()
 endif()
 
 set(EXTRA_LIBS)
+set(YCODE_MIXDEVICE_ROOT
+  "C:/Users/Station/Desktop/IrisBuild"
+  CACHE PATH "Path to the IrisBuild checkout that provides mix_device.h and mix_device.dll")
+set(YCODE_MIXDEVICE_INCLUDE_DIR
+  "${YCODE_MIXDEVICE_ROOT}/tools/unreal/Plugin/Source/libmixdevice/include"
+  CACHE PATH "Directory containing mix_device.h")
+set(YCODE_MIXDEVICE_LIBRARY
+  "${YCODE_MIXDEVICE_ROOT}/target/debug/mix_device.dll.lib"
+  CACHE FILEPATH "mix_device import library")
+if(EXISTS "${YCODE_MIXDEVICE_INCLUDE_DIR}/mix_device.h" AND EXISTS "${YCODE_MIXDEVICE_LIBRARY}")
+  list(APPEND EXTRA_LIBS ${YCODE_MIXDEVICE_LIBRARY})
+endif()
 if (CMAKE_SYSTEM_NAME MATCHES "NetBSD")
   list(APPEND EXTRA_LIBS kvm)
 endif()
@@ -191,4 +204,11 @@ add_lldb_library(lldbHost NO_PLUGIN_DEPENDENCIES
     ${LLDBObjCLibs}
     ${LLDB_LIBEDIT_LIBS}
   )
+
+if(EXISTS "${YCODE_MIXDEVICE_INCLUDE_DIR}/mix_device.h" AND EXISTS "${YCODE_MIXDEVICE_LIBRARY}")
+  target_compile_definitions(lldbHost PRIVATE LLDB_ENABLE_MIX_DEVICE=1)
+  target_include_directories(lldbHost PRIVATE ${YCODE_MIXDEVICE_INCLUDE_DIR})
+else()
+  target_compile_definitions(lldbHost PRIVATE LLDB_ENABLE_MIX_DEVICE=0)
+endif()
 

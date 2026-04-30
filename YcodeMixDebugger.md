@@ -4,6 +4,57 @@
 
 YCode Mobile Debugger 的目标是在 Windows 上为 Visual Studio 提供 iOS / Android 原生远程调试能力，覆盖安装、启动、Attach、断点、线程、调用栈、变量、表达式求值、内存查看、内存断点、符号管理以及性能分析联动。
 
+## 0. 当前实施路线更新（2026-04-30）
+
+Visual Studio 插件当前继续沿用已经落地的旧 MIEngine 路线，不在本阶段切换到
+自研 AD7 Debug Engine；但实现顺序调整为先把 `llvm-project/dtx` 的 runtime
+与 codegen 打底，方便 DebugHost 与后续 IDE 接入一气呵成。VSIX 在 DebugHost
+可用前仍走旧桥接路径：
+
+```text
+Visual Studio
+  ↓
+YCode / Mix VSIX
+  ↓
+MIEngine + lldb-mi
+  ↓
+DebugServerForwarder (loopback TCP)
+  ↓
+mixdevice FFI
+  ↓
+iOS debugserver / Android lldb-server
+```
+
+当前阶段的工程目标：
+
+```text
+1. 保留 MIEngine 承担 VS 调试窗口、断点、线程、调用栈、变量和表达式集成。
+2. VSIX 继续负责设备列表、启动 / Attach UI、符号路径传递、日志和屏幕工具窗口。
+3. DebugServerForwarder 继续把 MIEngine/lldb-mi 的本地 TCP 连接转发到设备调试服务。
+4. 优先补齐项目系统 F5 启动、Attach-to-Process 下拉双击 attach、符号路径自动发现和连接诊断。
+5. DTX / DebugHost / YDP 先作为底层基础设施推进；VSIX 切换到它们之前仍保留 MIEngine 旧路径。
+```
+
+因此，当前执行策略是：先实现 DTX runtime + schema + codegen，再实现
+DebugHost 服务，最后让 VS 插件从 MIEngine 桥接逐步迁移。当前可交付 VSIX 仍以
+MIEngine 方案为准。
+
+> 2026-04-30 DebugHost 实现更新：`YCode.DebugHost.exe` 的实现入口已落到
+> `lldb/tools/lldb-mixdev`，作为 LLDB 工具树里的独立 host executable 构建。
+> 该目标依赖 `dtxRuntime` 与 `dtx-codegen`，构建时生成 `DebugHostCore.td`
+> 对应的 C++ server dispatch glue；当前 MVP 已注册 `DebugHostCore.td` 中的全部
+> service processor：`Lifecycle`、`Session`、`Execution`、`Breakpoints`、
+> `Threads`、`Expressions`、`Memory`、`Device`。其中 `Lifecycle`、`Session`、
+> `Execution`、`Breakpoints`、`Threads`、`Expressions`、`Memory` 已接入
+> `liblldb` SB API 后端，`Device.list` 已接到 `mix_device`；移动设备
+> debugserver / lldb-server 的 mix 连接已按
+> `mix_device_create_lldb_connection` 路线接入 LLDB gdb-remote，`Device.prepareDebug`
+> 会调用 `mix_device_prepare_tools`。设备能力通过 IrisBuild 的
+> `mix_device.h` / `mix_device.dll.lib` 接入；若本机没有 mix_device SDK，目标仍可
+> 编译，但设备枚举会返回不可用状态。
+> 当前验证构建目录为 `F:\llvm-project\.build\x64`，通过 VS2022 `vcvars64.bat`
+> 初始化 MSVC 环境后执行 `ninja -C F:\llvm-project\.build\x64 ycode-debughost`。
+
 核心定位不是简单包装 LLDB，而是提供一套面向移动开发的完整调试链路：
 
 ```text
@@ -11,7 +62,7 @@ Visual Studio
   ↓
 YCode VS Extension / Debug Engine
   ↓
-YCode Debug Protocol
+DTX Protocol  (规划见 llvm-project/dtx/PLAN.md)
   ↓
 YCode Debug Host
   ↓
@@ -19,6 +70,13 @@ LLDB / Device Bridge / Symbol Manager
   ↓
 iOS debugserver / Android lldb-server
 ```
+
+IDE ↔ DebugHost 的所有交互都使用 DTX 协议承载，**不**自定义新的线协议。
+DTX 是 IDE ↔ DebugHost 之间的统一 RPC：DebugHost 充当 DTX server，VS 插件
+（含 AD7 Debug Engine）以及未来的 VS Code / Rider / Qt IDE 插件都是 DTX
+client。本文档剩余章节描述的"YCode Debug Protocol（YDP）"是这套 DTX 之上的
+**应用层 schema**（service / selector / aux 参数 / 命名 NSKeyedArchive 对象），
+而非独立的传输或编码层。
 
 设计原则：
 
@@ -58,8 +116,9 @@ iOS debugserver / Android lldb-server
 |  +---------------------------------------------+  |
 +-----------------------|---------------------------+
                         |
-                        | IPC: JSON-RPC / MessagePack
-                        | over Named Pipe
+                        | IPC: DTX over Named Pipe / TCP / UDS
+                        | (multi-channel; NSKeyedArchive payload)
+                        | 详见 llvm-project/dtx/PLAN.md
                         v
 +---------------------------------------------------+
 | YCode.DebugHost.exe                               |
@@ -243,94 +302,99 @@ IDebugExpression2
 
 ### 4.1 协议定位
 
-YDP 是 Visual Studio 插件与 Debug Host 之间的稳定调试协议。
+YDP 是 Visual Studio 插件与 Debug Host 之间的应用层调试 schema，**线协议
+统一使用 DTX**（参见 [llvm-project/dtx/PLAN.md](dtx/PLAN.md)）。本节定义服务、
+selector、命名对象，不重复定义传输与编码。
 
 它应该：
 
 ```text
-1. 类似 DAP，但不被 DAP 限死。
-2. 表达调试语义，而不是 LLDB API。
+1. 表达调试语义，而不是 LLDB API。
+2. 类似 DAP 风格的请求/响应/事件，但具体 selector / 对象由本文档定义。
 3. 支持移动端扩展能力。
-4. 支持 capability negotiation。
-5. 支持 request / response / event。
+4. 支持 capability negotiation（通过 DTX 握手 channel）。
+5. 支持 request / response / event 三种消息形态。
 6. 支持 cancellation 和 timeout。
-7. 支持大对象 stream / chunk 传输。
+7. 支持大对象 stream / chunk 传输（基于 DTX 多 channel + 分片）。
 ```
 
-建议传输：
+传输层完全交由 DTX：
 
 ```text
-MVP：JSON-RPC / DAP-like JSON over Named Pipe
-后期：MessagePack-RPC over Named Pipe
-远程：TCP + TLS
-大文件：stream / chunk / mmap file
+线协议  ：DTX（NSKeyedArchive 负载，多 channel 复用，分片）
+Transport：Named Pipe（Windows 同机首选）/ Unix Domain Socket（macOS/Linux）/ TCP
+鉴权    ：在 DTX 握手 channel 上交换 capability + token（具体方案见 §5）
+大对象  ：DTX 分片或专用 stream channel
+代码生成：dtx-codegen（C++ / Qt / Kotlin / C# 客户端，C++ DebugHost dispatch）
 ```
+
+> 不再使用 JSON-RPC / MessagePack-RPC 作为独立传输层；本文档之前版本中的
+> "JSON 例子"在新方案下是**逻辑 schema**：每条 JSON 描述一次 DTX selector
+> 调用的语义内容，由 DTX runtime 把它编码为 NSKeyedArchive 字典。
 
 ### 4.2 消息类型
 
-Request：
+DTX 原生支持三种消息形态，YDP 与之直接对齐：
+
+| YDP 概念 | DTX 形态                                    | DTX `flags`               | 备注                              |
+| -------- | ------------------------------------------- | ------------------------- | --------------------------------- |
+| Request  | selector + AuxList + `expects_reply=1`      | payload `0x02`            | client → host                     |
+| Response | reply 单对象                                 | payload `0x03` 或 `0x04`  | host → client，`conversation_id=1` |
+| Event    | selector + AuxList + `expects_reply=0`，反向 channel | payload `0x02` | host → client，async              |
+
+每条 IDE → Host 请求都对应一个 selector，放到该 service 所属的 channel 上。
+`seq` / `request_seq` 由 DTX 的 `message_id` / `conversation_id` 自然承载，
+schema 层不再单独编码。
+
+逻辑示例（在本文档其它章节使用的 JSON 形式）：
 
 ```json
 {
-  "seq": 12,
-  "type": "request",
   "command": "stackTrace",
-  "arguments": {}
+  "arguments": { "sessionId": "s-7f31", "threadId": 42 }
 }
 ```
 
-Response：
-
-```json
-{
-  "seq": 13,
-  "type": "response",
-  "request_seq": 12,
-  "success": true,
-  "body": {}
-}
-```
-
-Event：
-
-```json
-{
-  "seq": 14,
-  "type": "event",
-  "event": "stopped",
-  "body": {
-    "sessionId": "ios-001",
-    "threadId": 3,
-    "reason": "breakpoint"
-  }
-}
-```
-
-### 4.3 命名空间
-
-建议命令分组：
+落到 DTX 层等价于：
 
 ```text
-initialize / shutdown
-session.*
-device.*
-app.*
-execution.*
-breakpoints.*
-watchpoints.*
-threads
-stackTrace
-scopes
-variables
-evaluate
-memory.*
-disassemble
-modules
-symbols.*
-sourceMap.*
-trace.*
-perf.*
+channel    : org.llvm.debughost.threads
+selector   : stackTrace:
+aux        : NSDictionary { sessionId="s-7f31", threadId=42 }
+expects_reply : true
 ```
+
+Reply 是一个命名 NSKeyedArchive 对象（如 `StackTraceResult`，对应原 JSON
+`body`）；Event 是 host → client 反向 channel 上的 selector + aux，例如
+`org.llvm.debughost.events` channel 上的 `stopped:` selector，aux 携带
+`StoppedEvent` 字典。
+
+### 4.3 服务与 channel 命名
+
+DTX channel identifier 使用 `org.llvm.debughost.*` 命名空间，与
+[dtx/PLAN.md §6.1](dtx/PLAN.md) 一致。建议的服务划分：
+
+| 服务 channel                                  | 覆盖的 YDP 命令族                      |
+| --------------------------------------------- | -------------------------------------- |
+| `org.llvm.debughost.lifecycle`                | `initialize`、`shutdown`               |
+| `org.llvm.debughost.session`                  | `session.*`                            |
+| `org.llvm.debughost.device`                   | `device.*`                             |
+| `org.llvm.debughost.app`                      | `app.*`                                |
+| `org.llvm.debughost.execution`                | `execution.*`、`launch`、`attach`、`disconnect` |
+| `org.llvm.debughost.breakpoints`              | `breakpoints.*`                        |
+| `org.llvm.debughost.watchpoints`              | `watchpoints.*`                        |
+| `org.llvm.debughost.threads`                  | `threads`、`stackTrace`、`scopes`、`variables` |
+| `org.llvm.debughost.expressions`              | `evaluate`                             |
+| `org.llvm.debughost.memory`                   | `memory.*`、`disassemble`              |
+| `org.llvm.debughost.modules`                  | `modules`                              |
+| `org.llvm.debughost.symbols`                  | `symbols.*`、`sourceMap.*`             |
+| `org.llvm.debughost.trace`                    | `trace.*`、`perf.*`                    |
+| `org.llvm.debughost.events`                   | 所有异步事件（host → client）          |
+
+selector 命名遵循 [dtx/PLAN.md §6.1](dtx/PLAN.md) 的推导规则：0 参数为
+lowerCamel，1 参数为 `method:`，多参数为 `method:firstArgRest:`。`command`
+字段中带 `.` 的（例如 `breakpoints.setSource`）按其后缀生成 selector
+（`setSource:`），由 channel 区分命令族。
 
 ### 4.4 与 DAP 的关系
 
@@ -387,7 +451,22 @@ perf.sample
 
 ## 5. 协议生命周期
 
+> 本节及之后章节中的 JSON 例子表示**逻辑 schema**。每条 `request` 在
+> 实现层等价于一次 DTX selector 调用：`command` 决定 channel + selector，
+> `arguments` 字段构成 selector 的命名 NSKeyedArchive 对象（aux 第一个 obj），
+> `body` 字段则是 reply 的命名对象。在生产代码中，IDE 与 DebugHost 不直接
+> 拼接 JSON，而是通过 `dtx-codegen` 生成的强类型 client / dispatcher 调用。
+
 ### 5.1 Initialize
+
+`initialize` 不通过普通业务 channel，而是直接复用 DTX 的握手能力：连接建立
+后，DebugHost 发出 `_notifyOfPublishedCapabilities:`（沿用 DTX 标准握手
+selector），其 aux 携带本节 Response `body` 中的 `capabilities` 字段；IDE
+回发同名 selector 报告自身能力，对应 Request 中的 `capabilities`。这一段
+握手语义和 [dtx/PLAN.md §2](dtx/PLAN.md) 中描述的能力发布机制一致，无需
+单独定义 channel。
+
+逻辑 schema（IDE → Host）：
 
 ```json
 {
@@ -2137,42 +2216,61 @@ host.error
 
 ## 24. 目录结构建议
 
-### 24.1 Protocol 仓库
+### 24.1 Protocol Schema
+
+YDP schema 不再独立成仓，而是直接落在 `llvm-project/dtx/schema/` 下，
+与 DTX runtime / codegen 共享同一份 TableGen IDL（详见
+[dtx/PLAN.md §3](dtx/PLAN.md)）。多语言客户端代码由 `dtx-codegen` 自动产出。
 
 ```text
-ycode-debug-protocol/
+llvm-project/dtx/
   schema/
-    protocol.schema.json
-    capabilities.schema.json
-    errors.schema.json
-    events.schema.json
+    DTXBase.td
+    DebugHostCore.td      # process / threads / breakpoints / expressions / memory / modules / symbols
+    DebugHostEvents.td    # stop / output / module loaded / symbol status 等异步事件
   docs/
-    lifecycle.md
-    breakpoints.md
-    watchpoints.md
-    variables.md
-    symbols.md
-    mobile-ios.md
-    mobile-android.md
-  csharp/
-    YCode.DebugProtocol/
-  cpp/
-    ycode_debug_protocol/
-  rust/
-    ycode-debug-protocol/
+    services/lifecycle.md
+    services/breakpoints.md
+    services/watchpoints.md
+    services/variables.md
+    services/symbols.md
+    services/mobile-ios.md
+    services/mobile-android.md
+  fixtures/
+    frames/               # IDE ↔ DebugHost 录制流量，用于 round-trip 测试
+  runtime/
+    cpp-llvm/             # DebugHost 直接链接（client + server/dispatch）
+    cpp-qt/               # Qt IDE 客户端 runtime
+    kotlin/               # JetBrains 平台客户端 runtime
+    csharp/               # Visual Studio / .NET 客户端 runtime
+  tools/dtx-codegen/      # 由 .td 生成各语言 client（Qt/Kotlin/C# client-only）
+                          # + DebugHost dispatch（仅 cpp-llvm）
 ```
 
 ### 24.2 Debug Host
 
 ```text
-YCode.DebugHost/
-  Core/
-    SessionManager
-    ProtocolServer
-    EventBus
-    OperationManager
+llvm-project/lldb/tools/lldb-mixdev/
+  CMakeLists.txt              # 构建 ycode-debughost，输出名 YCode.DebugHost.exe
+  Main.cpp                    # DTX TCP server 入口，注册 generated DebugHostServer
+  DebugHostServices.h/.cpp    # 聚合所有 DebugHostCore.td generated processor
+  LldbBackend.h/.cpp          # liblldb SB API 会话、launch/attach、断点、线程、变量、内存
+  MixDeviceBridge.h/.cpp      # mix_device.h C FFI 的 C++ RAII/对象化边界
+  Core/                       # 后续扩展：SessionManager / EventBus / OperationManager
+  Services/                   # 后续拆分：每个 I<Service>Processor 一个实现文件
+    LifecycleService          # 当前在 DebugHostServices.cpp 中实现
+    DeviceService             # 当前在 DebugHostServices.cpp + MixDeviceBridge 中实现
+    SessionService            # 当前通过 LldbBackend 创建 / 关闭 SBDebugger session
+    ExecutionService          # 当前通过 SBTarget / SBProcess launch、attach、continue、pause
+    BreakpointService         # 当前通过 SBTarget::BreakpointCreateByLocation 设置源码断点
+    ThreadsService            # 当前通过 SBProcess / SBThread / SBFrame 暴露 threads、stack、scopes、variables
+    ExpressionsService        # 当前通过 SBFrame::EvaluateExpression 求值
+    MemoryService             # 当前通过 SBProcess::ReadMemory / SBTarget::ReadInstructions
+    ModulesService            # 后续 schema 扩展
+    SymbolsService            # 后续 schema 扩展
+    TraceService              # 后续 schema 扩展
   Backends/
-    LldbBackend
+    LldbBackend               # 当前已接入 liblldb SB API；mix URL 通过 gdb-remote 连接
     AndroidBackend
     IosBackend
   Symbols/
@@ -2180,13 +2278,81 @@ YCode.DebugHost/
     SymbolCache
     DsymScanner
     ElfBuildIdScanner
-  Devices/
-    IosDeviceBridge
-    AndroidDeviceBridge
   Diagnostics/
     Logging
     CrashRecovery
 ```
+
+LLDB gdb-remote 的 mix 连接被接在 LLDB Host 层，而不是只放在 DebugHost
+外层做 TCP 转发：
+
+```text
+lldb/include/lldb/Host/ConnectionRemoteIOS.h
+lldb/source/Host/common/ConnectionRemoteIOS.cpp
+lldb/source/Plugins/Process/gdb-remote/ProcessGDBRemote.cpp
+lldb/source/Plugins/Platform/gdb-server/PlatformRemoteGDBServer.cpp
+```
+
+`ConnectionRemoteIOS` 识别 `ios://<deviceId>`、`android://<deviceId>`、
+`mix-ios://<deviceId>`、`mix-android://<deviceId>` 这类 URL；连接时先调用
+`mix_connect_device`，再调用 `mix_device_create_lldb_connection`，后续
+`Read` / `Write` / `InterruptRead` 分别转到 `mix_lldb_connection_read`、
+`mix_lldb_connection_write`、`mix_lldb_connection_interrupt_read`。因此
+`ProcessGDBRemote::ConnectToDebugserver` 和 `platform connect` 可以直接把
+mix URL 当作 gdb-remote transport 使用。
+
+当前 MVP 的运行形态：
+
+```text
+YCode.DebugHost.exe --print-port --serve-one
+  1. 监听 loopback TCP，并输出 PORT=<port>。
+  2. 通过 dtx::ServerSession 读取一条 DTX selector request。
+  3. 使用 dtx-codegen 生成的 DebugHostServer 按 channel id + selector dispatch。
+  4. Lifecycle.initialize 返回 LLDB 与 mix_device capability 字典。
+  5. Device.list 调用 mix_list_devices，并把 uid/name/platform/osVersion/features
+     转成 NSObject 字典数组。
+  6. Device.prepareDebug 调用 mix_device_prepare_tools，并返回 before/after state
+     与 progress 列表。
+  7. Session / Execution / Breakpoints / Threads / Expressions / Memory 已注册
+     processor，并进入 LldbBackend 的真实 SB API 路径；缺少 session / target /
+     process 时返回结构化错误，不再返回未接线 stub。
+  8. launch / attach 请求若携带 platform=ios/android + deviceId，或显式 connectUrl，
+     会通过 SBTarget::ConnectRemote(..., "gdb-remote") 进入 mix LLDB 连接。
+```
+
+当前本地构建命令：
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+cmake -G Ninja -S F:\llvm-project\llvm -B F:\llvm-project\.build\x64 ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DLLVM_ENABLE_PROJECTS=clang;dtx;lldb ^
+  -DLLVM_TARGETS_TO_BUILD=X86;AArch64 ^
+  -DLLDB_ENABLE_PYTHON=OFF -DLLDB_ENABLE_LUA=OFF -DLLDB_ENABLE_LIBXML2=OFF ^
+  -DLLDB_ENABLE_LZMA=OFF -DLLDB_ENABLE_CURSES=OFF ^
+  -DYCODE_MIXDEVICE_ROOT=C:\Users\Station\Desktop\IrisBuild
+ninja -C F:\llvm-project\.build\x64 ycode-debughost
+```
+
+DebugHost 的 C# .NET Framework 4.7.2 client 通信测试位于
+`dtx/test/csharp/YCodeDebugHostClientNet472`。测试会启动
+`YCode.DebugHost.exe --print-port`，使用 `dtx-codegen` 生成的 C# client 调用
+`initialize`、`device.list`、`device.prepareDebug`、`session.create/close`、执行、
+断点、线程、表达式和内存服务的基础成功/错误路径。可通过构建树目标直接运行：
+
+```bat
+ninja -C F:\llvm-project\.build\x64 ycode-debughost-csharp-net472-test
+```
+
+如果要带真实设备验证 `device.prepareDebug`，也可以手动运行：
+
+```bat
+F:\llvm-project\dtx\test\csharp\YCodeDebugHostClientNet472\bin\Debug\net472\YCodeDebugHostClientNet472.exe ^
+  F:\llvm-project\.build\x64\bin\YCode.DebugHost.exe --device-id <device-id> --platform ios
+```
+
+后续应把 `DebugHostServices.cpp` 中的 processor 拆到 `Services/`，并把 TCP
+transport 替换/补充为 Windows Named Pipe，供 VSIX 同机连接。
 
 ### 24.3 Visual Studio 插件
 
@@ -2201,11 +2367,55 @@ YCode.VisualStudio/
     AD7Property
     AD7Breakpoint
   Protocol/
-    DebugClient
+    DebugClient                # 调用 dtx-codegen 生成的 C# client（仅 client）
+                               # 内部依赖 csharp DTX runtime（runtime/csharp/）
   UI/
     DeviceWindow
     SymbolStatusWindow
     DiagnosticsWindow
+```
+
+当前 VSIX 接入状态：
+
+```text
+src/ycode/debugger/VSDebugger/
+  Protocol/Dtx/                  # 内嵌 net472 可编译的 DTX C# runtime
+  Protocol/Generated/            # dtx-codegen 生成的 DebugHost C# client/types
+  Protocol/DebugHostClientSession.cs
+                                 # 启动 YCode.DebugHost.exe --print-port，
+                                 # 建立 DTX TCP 连接并调用 initialize / device.prepareDebug
+  DebugBridge/MixDebugLauncher.cs
+                                 # Launch / Attach 进入旧 MIEngine 前先通过 DebugHost
+                                 # 做 device.prepareDebug；优先把返回的 connectUrl
+                                 # 写入 MIEngine 的 miDebuggerServerAddress。
+                                 # 如果 connectUrl 缺失，则回退到现有
+                                 # DebugServerForwarder + loopback TCP 路线。
+```
+
+`YCode.DebugHost.exe` 解析顺序为：
+
+```text
+1. 环境变量 YCODE_DEBUGHOST_EXE
+2. VSIX/MixDebugger.dll 同目录下的 YCode.DebugHost.exe
+3. 开发机 fallback: F:\llvm-project\.build\x64\bin\YCode.DebugHost.exe
+```
+
+VSIX 构建时会在 `dtx-codegen.exe` 和 `DebugHostCore.td` 可用时重新生成
+`Protocol/Generated/*.g.cs`，并会把 `YCode.DebugHost.exe`、`liblldb.dll` 和
+`debugger_mix_device.xml` 打进 VSIX。`DebugHostClientSession` 现在由
+`DebugSessionHandle` 保活，避免 `device.prepareDebug` 完成立刻 shutdown host。
+
+因此当前阶段已经把 VS 插件接到 DebugHost 协议上，并让 DebugHost 产出的
+`connectUrl` 进入 MIEngine 连接配置；但实际 VS 调试窗口、断点、线程和变量显示
+仍由旧 MIEngine 承担。后续 AD7 迁移时再把 `session.*`、`execution.*`、threads、
+variables、events 等服务逐步从 MIEngine 搬到 DebugHost。
+
+### 24.4 其它 IDE 插件
+
+```text
+YCode.JetBrains/             # IntelliJ / Rider 插件，依赖 runtime/kotlin/ + Kotlin client
+YCode.QtIDE/                 # Qt 工具或 Qt Creator 扩展，依赖 runtime/cpp-qt/ + Qt client
+YCode.CliTools/              # 命令行调试器 / 自动化测试，依赖 runtime/cpp-llvm/ + LLVM C++ client
 ```
 
 ---
@@ -2215,23 +2425,32 @@ YCode.VisualStudio/
 ### Phase 0：协议和 Host 骨架
 
 ```text
-1. 定义 YDP schema。
-2. 实现 JSON-RPC over Named Pipe。
-3. 实现 initialize / session.create / shutdown。
-4. 实现 DebugHost 日志和崩溃恢复。
-5. 实现 VS 插件启动 Host。
+1. 跟进 dtx/PLAN.md 的里程碑，落地 cpp-llvm DTX runtime（M0–M3）。（已完成 MVP）
+2. 在 dtx/schema/ 下编写 DebugHostCore.td / DebugHostEvents.td。（已完成 MVP）
+3. 在 lldb/tools/lldb-mixdev 中实现 YCode.DebugHost.exe，内嵌 dtx::Server，
+   注册 lifecycle / session / execution / breakpoints / threads / expressions /
+   memory / device 等 DebugHostCore 服务。（已完成 MVP：全部 service 已注册，
+   device.list 接入 mix_device；session / execution / breakpoints / threads /
+   expressions / memory 已接入 liblldb SB API）
+4. 通过 dtx-codegen 生成 C# client，VS 插件接入并跑通 initialize /
+   session.create / shutdown / 一个 stopped 事件。
+5. 实现 DebugHost 日志和崩溃恢复。
+6. 实现 VS 插件启动 Host（Named Pipe Transport）。
 ```
 
 ### Phase 1：LLDB 基础调试
 
 ```text
-1. 集成 liblldb SB API。
-2. 实现 launch / attach 基础流程。
-3. 实现 breakpoint。
-4. 实现 continue / pause / step。
-5. 实现 threads / stackTrace。
-6. 实现 scopes / variables。
-7. 实现 evaluate。
+1. 集成 liblldb SB API。（已完成基础接入）
+2. 实现 launch / attach 基础流程。（已完成本地 SBTarget / SBProcess 路径）
+3. 实现 breakpoint。（已完成源码断点基础路径）
+4. 实现 continue / pause / step。（continue / pause 已完成；step 待扩展 schema）
+5. 实现 threads / stackTrace。（已完成基础路径）
+6. 实现 scopes / variables。（已完成 variablesReference 基础路径）
+7. 实现 evaluate。（已完成 frame expression 基础路径）
+8. 实现 readMemory / disassemble。（已完成基础路径）
+9. 实现 stopped / continued / exited event。
+10. 实现 source map。
 ```
 
 ### Phase 2：移动设备链路
@@ -2346,7 +2565,7 @@ YCode 的 Visual Studio 移动调试器应采用：
 ```text
 Visual Studio AD7 Debug Engine
     +
-YCode Debug Protocol
+DTX 协议（线协议） + YDP schema（应用层）
     +
 进程外 MixDevice.DebugHost.exe
     +
