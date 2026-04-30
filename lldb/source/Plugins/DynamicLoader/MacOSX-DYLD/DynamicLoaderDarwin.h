@@ -208,6 +208,10 @@ protected:
   std::vector<std::pair<ImageInfo, lldb::ModuleSP>>
   PreloadModulesFromImageInfos(const ImageInfo::collection &image_infos);
 
+  std::vector<std::pair<ImageInfo, lldb::ModuleSP>>
+  PreloadModulesFromImageInfos(const ImageInfo::collection &image_infos,
+                               bool defer_shared_library_images);
+
   // If `images` contains / may contain dyld or executable image, call this
   // method to keep our internal record keeping of the special binaries
   // up-to-date.

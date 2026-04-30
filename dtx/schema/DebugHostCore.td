@@ -19,7 +19,10 @@ def Execution : DTXService<"Execution", "org.llvm.debughost.execution", 1> {
     DTXMethod<"launch", [DTXArg<"request", DTXObject<"LaunchRequest">>], DTXObject<"LaunchResult">, "launch:">,
     DTXMethod<"attach", [DTXArg<"request", DTXObject<"AttachRequest">>], DTXObject<"AttachResult">, "attach:">,
     DTXMethod<"continueExecution", [DTXArg<"request", DTXObject<"ContinueRequest">>], DTXObject<"ContinueResult">, "continue:">,
-    DTXMethod<"pause", [DTXArg<"request", DTXObject<"PauseRequest">>], DTXObject<"PauseResult">, "pause:">
+    DTXMethod<"pause", [DTXArg<"request", DTXObject<"PauseRequest">>], DTXObject<"PauseResult">, "pause:">,
+    DTXMethod<"stepIn", [DTXArg<"request", DTXObject<"StepInRequest">>], DTXObject<"StepInResult">, "stepIn:">,
+    DTXMethod<"stepOver", [DTXArg<"request", DTXObject<"StepOverRequest">>], DTXObject<"StepOverResult">, "stepOver:">,
+    DTXMethod<"stepOut", [DTXArg<"request", DTXObject<"StepOutRequest">>], DTXObject<"StepOutResult">, "stepOut:">
   ];
 }
 
@@ -34,7 +37,8 @@ def Threads : DTXService<"Threads", "org.llvm.debughost.threads", 1> {
     DTXMethod<"list", [DTXArg<"request", DTXObject<"ThreadsRequest">>], DTXObject<"ThreadsResult">, "threads:">,
     DTXMethod<"stackTrace", [DTXArg<"request", DTXObject<"StackTraceRequest">>], DTXObject<"StackTraceResult">, "stackTrace:">,
     DTXMethod<"scopes", [DTXArg<"request", DTXObject<"ScopesRequest">>], DTXObject<"ScopesResult">, "scopes:">,
-    DTXMethod<"variables", [DTXArg<"request", DTXObject<"VariablesRequest">>], DTXObject<"VariablesResult">, "variables:">
+    DTXMethod<"variables", [DTXArg<"request", DTXObject<"VariablesRequest">>], DTXObject<"VariablesResult">, "variables:">,
+    DTXMethod<"registers", [DTXArg<"request", DTXObject<"RegistersRequest">>], DTXObject<"RegistersResult">, "registers:">
   ];
 }
 
@@ -51,9 +55,24 @@ def Memory : DTXService<"Memory", "org.llvm.debughost.memory", 1> {
   ];
 }
 
+def Modules : DTXService<"Modules", "org.llvm.debughost.modules", 1> {
+  let Methods = [
+    DTXMethod<"list", [DTXArg<"request", DTXObject<"ModulesRequest">>], DTXObject<"ModulesResult">, "modules:">,
+    DTXMethod<"reloadSymbols", [DTXArg<"request", DTXObject<"ReloadSymbolsRequest">>], DTXObject<"ReloadSymbolsResult">, "reloadSymbols:">
+  ];
+}
+
 def Device : DTXService<"Device", "org.llvm.debughost.device", 1> {
   let Methods = [
     DTXMethod<"list", [DTXArg<"request", DTXObject<"DeviceListRequest">>], DTXObject<"DeviceListResult">, "list:">,
     DTXMethod<"prepareDebug", [DTXArg<"request", DTXObject<"DevicePrepareDebugRequest">>], DTXObject<"DevicePrepareDebugResult">, "prepareDebug:">
+  ];
+}
+
+def DeviceSymbols : DTXService<"DeviceSymbols", "org.llvm.debughost.deviceSymbols", 1> {
+  let Methods = [
+    DTXMethod<"status", [DTXArg<"request", DTXObject<"DeviceSymbolsStatusRequest">>], DTXObject<"DeviceSymbolsStatusResult">, "status:">,
+    DTXMethod<"validate", [DTXArg<"request", DTXObject<"DeviceSymbolsValidateRequest">>], DTXObject<"DeviceSymbolsValidateResult">, "validate:">,
+    DTXMethod<"prefetch", [DTXArg<"request", DTXObject<"DeviceSymbolsPrefetchRequest">>], DTXObject<"DeviceSymbolsPrefetchResult">, "prefetch:">
   ];
 }

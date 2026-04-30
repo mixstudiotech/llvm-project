@@ -14,8 +14,10 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
+#include <chrono>
 #include <limits>
 #include <optional>
+#include <thread>
 
 #if LLDB_ENABLE_MIX_DEVICE
 #include "mix_device.h"
@@ -150,13 +152,18 @@ ConnectionStatus ConnectionRemoteIOS::Connect(llvm::StringRef Url,
     m_device = nullptr;
   }
 
-  CallbackResult Result{Error, eConnectionStatusError};
+  CallbackResult Result{Error, eConnectionStatusSuccess};
   mix_device_t *Device = nullptr;
   std::string DeviceUrl = makeMixDeviceUrl(*Parsed);
   mix_connect_device(DeviceUrl.c_str(), &Device, errorCallback, &Result);
-  if (Result.Status != eConnectionStatusSuccess || !Device)
+  if (Result.Status != eConnectionStatusSuccess)
     return Result.Status;
+  if (!Device) {
+    setError(Error, "mix_device failed to connect to the requested device");
+    return eConnectionStatusError;
+  }
 
+  Result.Status = eConnectionStatusError;
   std::string DebugPort = makeDebugPort(*Parsed);
   mix_lldb_debugger *Connection = mix_device_create_lldb_connection(
       Device, DebugPort.c_str(), connectionStatusCallback, &Result);
@@ -204,8 +211,8 @@ bool ConnectionRemoteIOS::IsConnected() const {
   return false;
 #else
   std::lock_guard<std::mutex> Guard(m_mutex);
-  return m_connection &&
-         mix_lldb_connection_is_connected(asDebugger(m_connection));
+  void *Connection = m_connection;
+  return Connection && mix_lldb_connection_is_connected(asDebugger(Connection));
 #endif
 }
 
@@ -217,8 +224,12 @@ size_t ConnectionRemoteIOS::Read(void *Dst, size_t DstLen,
   setError(Error, "mix_device SDK is not linked into this LLDB build");
   return 0;
 #else
-  std::lock_guard<std::mutex> Guard(m_mutex);
-  if (!m_connection) {
+  void *Connection = nullptr;
+  {
+    std::lock_guard<std::mutex> Guard(m_mutex);
+    Connection = m_connection;
+  }
+  if (!Connection) {
     ConnStatus = eConnectionStatusNoConnection;
     return 0;
   }
@@ -228,7 +239,7 @@ size_t ConnectionRemoteIOS::Read(void *Dst, size_t DstLen,
   if (Timeout)
     TimeoutUS = static_cast<uint64_t>(Timeout->count());
   size_t Bytes =
-      mix_lldb_connection_read(asDebugger(m_connection), Dst, DstLen,
+      mix_lldb_connection_read(asDebugger(Connection), Dst, DstLen,
                                TimeoutUS, connectionStatusCallback, &Result);
   ConnStatus = Result.Status;
   return Bytes;
@@ -242,17 +253,24 @@ size_t ConnectionRemoteIOS::Write(const void *Src, size_t SrcLen,
   setError(Error, "mix_device SDK is not linked into this LLDB build");
   return 0;
 #else
-  std::lock_guard<std::mutex> Guard(m_mutex);
-  if (!m_connection) {
+  void *Connection = nullptr;
+  {
+    std::lock_guard<std::mutex> Guard(m_mutex);
+    Connection = m_connection;
+  }
+  if (!Connection) {
     ConnStatus = eConnectionStatusNoConnection;
     return 0;
   }
 
   CallbackResult Result{Error, eConnectionStatusSuccess};
   size_t Bytes =
-      mix_lldb_connection_write(asDebugger(m_connection), Src, SrcLen,
+      mix_lldb_connection_write(asDebugger(Connection), Src, SrcLen,
                                 connectionStatusCallback, &Result);
   ConnStatus = Result.Status;
+  if (ConnStatus == eConnectionStatusSuccess && Bytes == SrcLen &&
+      SrcLen == 1 && static_cast<const char *>(Src)[0] == '+')
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   return Bytes;
 #endif
 }
@@ -263,9 +281,12 @@ bool ConnectionRemoteIOS::InterruptRead() {
 #if !LLDB_ENABLE_MIX_DEVICE
   return false;
 #else
-  std::lock_guard<std::mutex> Guard(m_mutex);
-  return m_connection &&
-         mix_lldb_connection_interrupt_read(asDebugger(m_connection));
+  void *Connection = nullptr;
+  {
+    std::lock_guard<std::mutex> Guard(m_mutex);
+    Connection = m_connection;
+  }
+  return Connection && mix_lldb_connection_interrupt_read(asDebugger(Connection));
 #endif
 }
 

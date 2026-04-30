@@ -5,6 +5,8 @@
 #include "LldbBackend.h"
 #include "MixDeviceBridge.h"
 
+#include <functional>
+
 namespace ycode::debughost {
 
 class LifecycleProcessor final
@@ -58,6 +60,15 @@ public:
   llvm::dtx::Expected<llvm::dtx::debughost::PauseResult>
   pause(const llvm::dtx::debughost::PauseRequest &Request) override;
 
+  llvm::dtx::Expected<llvm::dtx::debughost::StepInResult>
+  stepIn(const llvm::dtx::debughost::StepInRequest &Request) override;
+
+  llvm::dtx::Expected<llvm::dtx::debughost::StepOverResult>
+  stepOver(const llvm::dtx::debughost::StepOverRequest &Request) override;
+
+  llvm::dtx::Expected<llvm::dtx::debughost::StepOutResult>
+  stepOut(const llvm::dtx::debughost::StepOutRequest &Request) override;
+
 private:
   LldbBackend &Backend_;
 };
@@ -91,6 +102,9 @@ public:
   llvm::dtx::Expected<llvm::dtx::debughost::VariablesResult>
   variables(const llvm::dtx::debughost::VariablesRequest &Request) override;
 
+  llvm::dtx::Expected<llvm::dtx::debughost::RegistersResult>
+  registers(const llvm::dtx::debughost::RegistersRequest &Request) override;
+
 private:
   LldbBackend &Backend_;
 };
@@ -122,6 +136,21 @@ private:
   LldbBackend &Backend_;
 };
 
+class ModulesProcessor final : public llvm::dtx::debughost::IModulesProcessor {
+public:
+  explicit ModulesProcessor(LldbBackend &Backend);
+
+  llvm::dtx::Expected<llvm::dtx::debughost::ModulesResult>
+  list(const llvm::dtx::debughost::ModulesRequest &Request) override;
+
+  llvm::dtx::Expected<llvm::dtx::debughost::ReloadSymbolsResult>
+  reloadSymbols(
+      const llvm::dtx::debughost::ReloadSymbolsRequest &Request) override;
+
+private:
+  LldbBackend &Backend_;
+};
+
 class DeviceProcessor final : public llvm::dtx::debughost::IDeviceProcessor {
 public:
   explicit DeviceProcessor(MixDeviceBridge &Bridge);
@@ -137,11 +166,35 @@ private:
   MixDeviceBridge &Bridge_;
 };
 
+class DeviceSymbolsProcessor final
+    : public llvm::dtx::debughost::IDeviceSymbolsProcessor {
+public:
+  explicit DeviceSymbolsProcessor(MixDeviceBridge &Bridge);
+  void setEventSink(DebugHostEventSink Sink) { EventSink_ = std::move(Sink); }
+
+  llvm::dtx::Expected<llvm::dtx::debughost::DeviceSymbolsStatusResult>
+  status(
+      const llvm::dtx::debughost::DeviceSymbolsStatusRequest &Request) override;
+
+  llvm::dtx::Expected<llvm::dtx::debughost::DeviceSymbolsValidateResult>
+  validate(const llvm::dtx::debughost::DeviceSymbolsValidateRequest &Request)
+      override;
+
+  llvm::dtx::Expected<llvm::dtx::debughost::DeviceSymbolsPrefetchResult>
+  prefetch(const llvm::dtx::debughost::DeviceSymbolsPrefetchRequest &Request)
+      override;
+
+private:
+  MixDeviceBridge &Bridge_;
+  DebugHostEventSink EventSink_;
+};
+
 class DebugHostServices {
 public:
   explicit DebugHostServices(MixDeviceBridge &Bridge);
 
   void registerWith(llvm::dtx::debughost::DebugHostServer &Server);
+  void setEventSink(DebugHostEventSink Sink);
   bool shouldStop() const { return Lifecycle_.shouldStop(); }
 
 private:
@@ -153,7 +206,9 @@ private:
   ThreadsProcessor Threads_;
   ExpressionsProcessor Expressions_;
   MemoryProcessor Memory_;
+  ModulesProcessor Modules_;
   DeviceProcessor Device_;
+  DeviceSymbolsProcessor DeviceSymbols_;
 };
 
 } // namespace ycode::debughost

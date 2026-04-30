@@ -109,6 +109,11 @@ using namespace lldb_private::process_gdb_remote;
 
 LLDB_PLUGIN_DEFINE(ProcessGDBRemote)
 
+static bool MixDevFastAttachEnabled() {
+  const char *fast_attach = std::getenv("LLDB_MIXDEV_FAST_ATTACH");
+  return fast_attach && llvm::StringRef(fast_attach) == "1";
+}
+
 namespace lldb {
 // Provide a function that can easily dump the packet history if we know a
 // ProcessGDBRemote * value (which we can get from logs or from debugging). We
@@ -454,6 +459,18 @@ void ProcessGDBRemote::BuildDynamicRegisterInfo(bool force) {
   Log *log = GetLog(GDBRLog::Process);
   LLDB_LOG_ERROR(log, std::move(register_info_err),
                  "Failed to read register information from target XML: {0}");
+
+  if (MixDevFastAttachEnabled()) {
+    std::vector<DynamicRegisterInfo::Register> registers =
+        GetFallbackRegisters(arch_to_use);
+    if (!registers.empty()) {
+      LLDB_LOG(log,
+               "Using fallback register information for fast mixdev attach.");
+      AddRemoteRegisters(registers, arch_to_use);
+      return;
+    }
+  }
+
   LLDB_LOG(log, "Now trying to use qRegisterInfo instead.");
 
   char packet[128];
@@ -1042,15 +1059,19 @@ void ProcessGDBRemote::DidLaunchOrAttach(ArchSpec &process_arch) {
   LoadStubBinaries();
   MaybeLoadExecutableModule();
 
-  // Find out which StructuredDataPlugins are supported by the debug monitor.
-  // These plugins transmit data over async $J packets.
-  if (StructuredData::Array *supported_packets =
-          m_gdb_comm.GetSupportedStructuredDataPlugins())
-    MapSupportedStructuredDataPlugins(*supported_packets);
+  if (!MixDevFastAttachEnabled()) {
+    // Find out which StructuredDataPlugins are supported by the debug monitor.
+    // These plugins transmit data over async $J packets.
+    if (StructuredData::Array *supported_packets =
+            m_gdb_comm.GetSupportedStructuredDataPlugins())
+      MapSupportedStructuredDataPlugins(*supported_packets);
+  }
 
-  // If connected to LLDB ("native-signals+"), use signal defs for
-  // the remote platform.  If connected to GDB, just use the standard set.
-  if (!m_gdb_comm.UsesNativeSignals()) {
+  if (MixDevFastAttachEnabled()) {
+    SetUnixSignals(UnixSignals::Create(GetTarget().GetArchitecture()));
+  } else if (!m_gdb_comm.UsesNativeSignals()) {
+    // If connected to LLDB ("native-signals+"), use signal defs for
+    // the remote platform.  If connected to GDB, just use the standard set.
     SetUnixSignals(std::make_shared<GDBRemoteSignals>());
   } else {
     PlatformSP platform_sp = GetTarget().GetPlatform();
@@ -4264,9 +4285,16 @@ StructuredData::ObjectSP ProcessGDBRemote::GetLoadedDynamicLibrariesInfos(
 }
 
 StructuredData::ObjectSP ProcessGDBRemote::GetLoadedDynamicLibrariesInfos() {
+  return GetLoadedDynamicLibrariesInfos(!MixDevFastAttachEnabled());
+}
+
+StructuredData::ObjectSP
+ProcessGDBRemote::GetLoadedDynamicLibrariesInfos(bool report_load_commands) {
   StructuredData::ObjectSP args_dict(new StructuredData::Dictionary());
 
   args_dict->GetAsDictionary()->AddBooleanItem("fetch_all_solibs", true);
+  if (!report_load_commands)
+    args_dict->GetAsDictionary()->AddBooleanItem("report_load_commands", false);
 
   return GetLoadedDynamicLibrariesInfos_sender(args_dict);
 }
@@ -4289,7 +4317,8 @@ ProcessGDBRemote::GetLoadedDynamicLibrariesInfos_sender(
     StructuredData::ObjectSP args_dict) {
   StructuredData::ObjectSP object_sp;
 
-  if (m_gdb_comm.GetLoadedDynamicLibrariesInfosSupported()) {
+  if (MixDevFastAttachEnabled() ||
+      m_gdb_comm.GetLoadedDynamicLibrariesInfosSupported()) {
     // Scope for the scoped timeout object
     GDBRemoteCommunication::ScopedTimeout timeout(m_gdb_comm,
                                                   std::chrono::seconds(10));
@@ -5544,6 +5573,9 @@ void ProcessGDBRemote::ModulesDidLoad(ModuleList &module_list) {
   // We must call the lldb_private::Process::ModulesDidLoad () first before we
   // do anything
   Process::ModulesDidLoad(module_list);
+
+  if (MixDevFastAttachEnabled())
+    return;
 
   // After loading shared libraries, we can ask our remote GDB server if it
   // needs any symbols.

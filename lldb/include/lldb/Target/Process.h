@@ -1356,6 +1356,11 @@ public:
     return StructuredData::ObjectSP();
   }
 
+  virtual lldb_private::StructuredData::ObjectSP
+  GetLoadedDynamicLibrariesInfos(bool report_load_commands) {
+    return GetLoadedDynamicLibrariesInfos();
+  }
+
   // On macOS 10.12, tvOS 10, iOS 10, watchOS 3 and newer, debugserver can
   // return information about binaries given their load addresses.
   virtual lldb_private::StructuredData::ObjectSP GetLoadedDynamicLibrariesInfos(

@@ -235,6 +235,9 @@ public:
 
   StructuredData::ObjectSP GetLoadedDynamicLibrariesInfos() override;
 
+  StructuredData::ObjectSP
+  GetLoadedDynamicLibrariesInfos(bool report_load_commands) override;
+
   StructuredData::ObjectSP GetLoadedDynamicLibrariesInfos(
       const std::vector<lldb::addr_t> &load_addresses) override;
 

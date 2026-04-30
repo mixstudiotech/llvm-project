@@ -58,9 +58,11 @@ internal static class Program
             var expressions = new ExpressionsClient(connection);
             var memory = new MemoryClient(connection);
             var device = new DeviceClient(connection);
+            var deviceSymbols = new DeviceSymbolsClient(connection);
 
             await TestInitializeAsync(lifecycle, timeout.Token).ConfigureAwait(false);
             await TestDeviceAsync(device, platform, deviceId, timeout.Token).ConfigureAwait(false);
+            await TestDeviceSymbolsErrorsAsync(deviceSymbols, timeout.Token).ConfigureAwait(false);
 
             var sessionId = await TestSessionCreateAsync(session, timeout.Token).ConfigureAwait(false);
             await TestExecutionErrorsAsync(execution, sessionId, timeout.Token).ConfigureAwait(false);
@@ -141,6 +143,16 @@ internal static class Program
             RequireKey(preparedRaw, "connectUrl", "device.prepareDebug real device");
             Console.WriteLine("ok device.prepareDebug real device");
         }
+    }
+
+    private static async Task TestDeviceSymbolsErrorsAsync(DeviceSymbolsClient deviceSymbols, CancellationToken token)
+    {
+        await ExpectFailureAsync("deviceSymbols.status missing id",
+            deviceSymbols.StatusAsync(new DeviceSymbolsStatusRequest { Raw = Dict() }, token)).ConfigureAwait(false);
+        await ExpectFailureAsync("deviceSymbols.validate missing id",
+            deviceSymbols.ValidateAsync(new DeviceSymbolsValidateRequest { Raw = Dict() }, token)).ConfigureAwait(false);
+        await ExpectFailureAsync("deviceSymbols.prefetch missing id",
+            deviceSymbols.PrefetchAsync(new DeviceSymbolsPrefetchRequest { Raw = Dict() }, token)).ConfigureAwait(false);
     }
 
     private static async Task<string> TestSessionCreateAsync(SessionClient session, CancellationToken token)

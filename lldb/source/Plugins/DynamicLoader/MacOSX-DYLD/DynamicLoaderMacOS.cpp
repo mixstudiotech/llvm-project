@@ -27,8 +27,89 @@
 
 #include "Plugins/TypeSystem/Clang/TypeSystemClang.h"
 
+#include <cstdlib>
+#include <thread>
+
 using namespace lldb;
 using namespace lldb_private;
+
+static bool MixDevFastAttachEnabled() {
+  const char *fast_attach = std::getenv("LLDB_MIXDEV_FAST_ATTACH");
+  return fast_attach && llvm::StringRef(fast_attach) == "1";
+}
+
+static bool MixDevAsyncModuleLoadEnabled() {
+  const char *async_module_load =
+      std::getenv("LLDB_MIXDEV_ASYNC_MODULE_LOAD");
+  return async_module_load && llvm::StringRef(async_module_load) == "1";
+}
+
+static bool LoadMainExecutableFromMinimalImageInfos(
+    Process *process, ModuleSP executable_sp,
+    StructuredData::ObjectSP image_info_json_sp) {
+  if (!process || !executable_sp || !image_info_json_sp ||
+      !image_info_json_sp->GetAsDictionary())
+    return false;
+
+  StructuredData::ObjectSP images_sp =
+      image_info_json_sp->GetAsDictionary()->GetValueForKey("images");
+  StructuredData::Array *images = images_sp ? images_sp->GetAsArray() : nullptr;
+  if (!images)
+    return false;
+
+  Target &target = process->GetTarget();
+  if (!executable_sp->GetObjectFile())
+    return false;
+
+  lldb::addr_t executable_load_address = LLDB_INVALID_ADDRESS;
+  for (size_t i = 0, count = images->GetSize(); i < count; ++i) {
+    StructuredData::Dictionary *image =
+        images->GetItemAtIndex(i)->GetAsDictionary();
+    if (!image || !image->HasKey("load_address") || !image->HasKey("pathname"))
+      continue;
+
+    if (i != 0) {
+      llvm::StringRef pathname =
+          image->GetValueForKey("pathname")->GetAsString()->GetValue();
+      FileSpec image_file(pathname, FileSpec::Style::posix);
+      if (image_file.GetFilename() !=
+          executable_sp->GetFileSpec().GetFilename())
+        continue;
+    }
+
+    executable_load_address =
+        image->GetValueForKey("load_address")->GetUnsignedIntegerValue();
+    break;
+  }
+
+  if (executable_load_address == LLDB_INVALID_ADDRESS)
+    return false;
+
+  SectionList *section_list =
+      executable_sp->GetObjectFile()->GetSectionList();
+  if (!section_list)
+    return false;
+
+  SectionSP text_section =
+      section_list->FindSectionByName(ConstString("__TEXT"));
+  if (!text_section)
+    return false;
+
+  const lldb::addr_t slide =
+      executable_load_address - text_section->GetFileAddress();
+  bool changed = false;
+  target.GetImages().AppendIfNeeded(executable_sp);
+  executable_sp->SetLoadAddress(target, slide, true, changed);
+  if (executable_sp.get() != target.GetExecutableModulePointer())
+    target.SetExecutableModule(executable_sp, eLoadDependentsNo);
+  if (changed) {
+    ModuleList loaded_modules;
+    loaded_modules.Append(executable_sp);
+    target.ModulesDidLoad(loaded_modules);
+  }
+
+  return true;
+}
 
 // Create an instance of this class. This function is filled into the plugin
 // info class that gets handed out by the plugin factory and allows the lldb to
@@ -90,6 +171,11 @@ DynamicLoaderMacOS::~DynamicLoaderMacOS() {
     m_process->GetTarget().RemoveBreakpointByID(m_break_id);
   if (LLDB_BREAK_ID_IS_VALID(m_dyld_handover_break_id))
     m_process->GetTarget().RemoveBreakpointByID(m_dyld_handover_break_id);
+}
+
+void DynamicLoaderMacOS::DidAttach() {
+  DynamicLoaderDarwin::DidAttach();
+  StartAsyncModuleLoad();
 }
 
 bool DynamicLoaderMacOS::ProcessDidExec() {
@@ -195,6 +281,7 @@ void DynamicLoaderMacOS::ClearNotificationBreakpoint() {
 // addresses.
 void DynamicLoaderMacOS::DoInitialImageFetch() {
   Log *log = GetLog(LLDBLog::DynamicLoader);
+  ModuleSP executable_sp = m_process->GetTarget().GetExecutableModule();
 
   // Remove any binaries we pre-loaded in the Target before
   // launching/attaching. If the same binaries are present in the process,
@@ -202,9 +289,42 @@ void DynamicLoaderMacOS::DoInitialImageFetch() {
   // from disk.
   UnloadAllImages();
 
-  StructuredData::ObjectSP all_image_info_json_sp(
-      m_process->GetLoadedDynamicLibrariesInfos());
+  if (MixDevFastAttachEnabled()) {
+    StructuredData::ObjectSP minimal_image_info_json_sp(
+        m_process->GetLoadedDynamicLibrariesInfos());
+    LoadMainExecutableFromMinimalImageInfos(m_process, executable_sp,
+                                            minimal_image_info_json_sp);
+    m_dyld_image_infos_stop_id = m_process->GetStopID();
+    return;
+  }
+
+  LoadAllModulesFromImageList(/*defer_shared_library_images=*/false,
+                              /*report_load_commands=*/true);
+  if (!MixDevFastAttachEnabled())
+    m_maybe_image_infos_address = m_process->GetImageInfoAddress();
+}
+
+void DynamicLoaderMacOS::StartAsyncModuleLoad() {
+  if (!MixDevAsyncModuleLoadEnabled())
+    return;
+  bool expected = false;
+  if (!m_async_module_load_started.compare_exchange_strong(expected, true))
+    return;
+
+  std::thread([this]() {
+    if (!m_process || !m_process->IsAlive())
+      return;
+    LoadAllModulesFromImageList(/*defer_shared_library_images=*/false,
+                                /*report_load_commands=*/true);
+  }).detach();
+}
+
+void DynamicLoaderMacOS::LoadAllModulesFromImageList(
+    bool defer_shared_library_images, bool report_load_commands) {
+  Log *log = GetLog(LLDBLog::DynamicLoader);
   ImageInfo::collection image_infos;
+  StructuredData::ObjectSP all_image_info_json_sp(
+      m_process->GetLoadedDynamicLibrariesInfos(report_load_commands));
   if (all_image_info_json_sp.get() &&
       all_image_info_json_sp->GetAsDictionary() &&
       all_image_info_json_sp->GetAsDictionary()->HasKey("images") &&
@@ -213,17 +333,17 @@ void DynamicLoaderMacOS::DoInitialImageFetch() {
           ->GetAsArray()) {
     if (JSONImageInformationIntoImageInfo(all_image_info_json_sp,
                                           image_infos)) {
-      LLDB_LOGF(log, "Initial module fetch:  Adding %" PRId64 " modules.\n",
+      LLDB_LOGF(log, "Module fetch: Adding %" PRId64 " modules.\n",
                 (uint64_t)image_infos.size());
 
-      auto images = PreloadModulesFromImageInfos(image_infos);
+      auto images =
+          PreloadModulesFromImageInfos(image_infos, defer_shared_library_images);
       UpdateSpecialBinariesFromPreloadedModules(images);
       AddModulesUsingPreloadedModules(images);
     }
   }
 
   m_dyld_image_infos_stop_id = m_process->GetStopID();
-  m_maybe_image_infos_address = m_process->GetImageInfoAddress();
 }
 
 bool DynamicLoaderMacOS::NeedToDoInitialImageFetch() { return true; }

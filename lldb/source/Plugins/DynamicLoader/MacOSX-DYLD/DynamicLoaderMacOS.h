@@ -17,6 +17,7 @@
 #ifndef LLDB_SOURCE_PLUGINS_DYNAMICLOADER_MACOSX_DYLD_DYNAMICLOADERMACOS_H
 #define LLDB_SOURCE_PLUGINS_DYNAMICLOADER_MACOSX_DYLD_DYNAMICLOADERMACOS_H
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -50,6 +51,12 @@ public:
   ///
   /// Allow DynamicLoader plug-ins to execute some code after
   /// attaching to a process.
+  void DidAttach() override;
+
+  /// Called after execing a process.
+  ///
+  /// Allow DynamicLoader plug-ins to execute some code after
+  /// execing a process.
   bool ProcessDidExec() override;
 
   lldb_private::Status CanLoadImage() override;
@@ -76,6 +83,11 @@ protected:
   void ClearDYLDHandoverBreakpoint();
 
   void AddBinaries(const std::vector<lldb::addr_t> &load_addresses);
+
+  void StartAsyncModuleLoad();
+
+  void LoadAllModulesFromImageList(bool defer_shared_library_images,
+                                   bool report_load_commands);
 
   void DoClear() override;
 
@@ -111,6 +123,7 @@ protected:
                                             // debugservers that don't support
                                             // the "reason:exec" annotation.
   bool m_libsystem_fully_initalized;
+  std::atomic<bool> m_async_module_load_started{false};
 };
 
 #endif // LLDB_SOURCE_PLUGINS_DYNAMICLOADER_MACOSX_DYLD_DYNAMICLOADERMACOS_H

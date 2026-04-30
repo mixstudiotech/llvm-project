@@ -45,10 +45,16 @@
 #define DEBUG_PRINTF(fmt, ...)
 #endif
 
+#include <cstdlib>
 #include <memory>
 
 using namespace lldb;
 using namespace lldb_private;
+
+static bool MixDevFastAttachEnabled() {
+  const char *fast_attach = std::getenv("LLDB_MIXDEV_FAST_ATTACH");
+  return fast_attach && llvm::StringRef(fast_attach) == "1";
+}
 
 // Constructor
 DynamicLoaderDarwin::DynamicLoaderDarwin(Process *process)
@@ -66,6 +72,8 @@ DynamicLoaderDarwin::~DynamicLoaderDarwin() = default;
 void DynamicLoaderDarwin::DidAttach() {
   PrivateInitialize(m_process);
   DoInitialImageFetch();
+  if (MixDevFastAttachEnabled())
+    return;
   SetNotificationBreakpoint();
 }
 
@@ -651,10 +659,23 @@ void DynamicLoaderDarwin::ClearDYLDModule() { m_dyld_module_wp.reset(); }
 std::vector<std::pair<DynamicLoaderDarwin::ImageInfo, ModuleSP>>
 DynamicLoaderDarwin::PreloadModulesFromImageInfos(
     const ImageInfo::collection &image_infos) {
+  return PreloadModulesFromImageInfos(image_infos, MixDevFastAttachEnabled());
+}
+
+std::vector<std::pair<DynamicLoaderDarwin::ImageInfo, ModuleSP>>
+DynamicLoaderDarwin::PreloadModulesFromImageInfos(
+    const ImageInfo::collection &image_infos,
+    bool defer_shared_library_images) {
   const auto size = image_infos.size();
   std::vector<std::pair<DynamicLoaderDarwin::ImageInfo, ModuleSP>> images(size);
   auto LoadImage = [&](size_t i, ImageInfo::collection::const_iterator it) {
     const auto &image_info = *it;
+    if (defer_shared_library_images &&
+        image_info.header.filetype != llvm::MachO::MH_EXECUTE &&
+        image_info.header.filetype != llvm::MachO::MH_DYLINKER) {
+      images[i] = std::make_pair(image_info, ModuleSP());
+      return;
+    }
     images[i] = std::make_pair(
         image_info, FindTargetModuleForImageInfo(image_info, true, nullptr));
   };
@@ -891,6 +912,9 @@ void DynamicLoaderDarwin::PrivateProcessStateChanged(Process *process,
     break;
 
   case eStateStopped:
+    if (MixDevFastAttachEnabled())
+      break;
+
     // Keep trying find dyld and set our notification breakpoint each time we
     // stop until we succeed
     if (!DidSetNotificationBreakpoint() && m_process->IsAlive()) {

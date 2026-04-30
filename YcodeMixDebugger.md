@@ -52,8 +52,9 @@ MIEngine 方案为准。
 > 会调用 `mix_device_prepare_tools`。设备能力通过 IrisBuild 的
 > `mix_device.h` / `mix_device.dll.lib` 接入；若本机没有 mix_device SDK，目标仍可
 > 编译，但设备枚举会返回不可用状态。
-> 当前验证构建目录为 `F:\llvm-project\.build\x64`，通过 VS2022 `vcvars64.bat`
-> 初始化 MSVC 环境后执行 `ninja -C F:\llvm-project\.build\x64 ycode-debughost`。
+> 当前验证构建目录为 `..\.build\llvm`，通过 VS2022 `vcvars64.bat`
+> 构建配置应该用RelWithDebInfo
+> 初始化 MSVC 环境后执行 `ninja -C ..\.build\llvm ycode-debughost`。
 
 核心定位不是简单包装 LLDB，而是提供一套面向移动开发的完整调试链路：
 
@@ -2583,3 +2584,152 @@ VS 侧做体验，Host 侧做调试，协议层做稳定边界，Symbol Cache �
 ```
 
 这个方案既能获得 LLDB 的强大调试能力，又不会让 Visual Studio 进程承担 LLDB 的复杂性；同时通过自研设备桥接和符号管理，保留 YCode 在 Windows 上移动开发工具链的核心竞争力。
+
+## 28. 代码审计：未实现/占位/桩逻辑清单（2026-05-01）
+
+针对 `F:\llvm-project\lldb\tools\lldb-mixdev`（DebugHost C++ 端）和
+`C:\Users\Station\Desktop\IrisBuild\src\ycode\debugger\VSDebugger`（VS 插件 C# 端）
+做了一次源码级走查，下列条目均已对照源码核实。`VS.E_NOTIMPL` 这种 COM 接口
+的纯义务实现（如 `SetThreadName`、Legacy DCOM Provider）和明确不支持的能力
+（Edit-and-Continue、native crash dump）已剔除，只列影响调试体验的真实缺口。
+
+### 28.1 高优先级 — 调试核心路径缺失
+
+#### 28.1.1 C++ Backend 协议表面不完整
+
+[LldbBackend.h](lldb/tools/lldb-mixdev/LldbBackend.h) 暴露的能力仅覆盖：
+launch/attach/continue/pause/stepIn/stepOver/stepOut + setSourceBreakpoints
++ threads/stackTrace/scopes/variables/registers + evaluate/readMemory/disassemble/modules。
+下列后端能力**完全缺失**，C# 端就算想实现也没接口可调：
+
+- **写内存**：无 `writeMemory` 端点 → [MixDebugMemory.cs:40](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixDebugMemory.cs#L40)
+  只能 `E_NOTIMPL`。VS Memory 视图无法编辑目标进程内存。
+- **赋值**：无 `setVariable` / `setExpression` 端点 →
+  [MixDebugExpression.cs:213,218](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixDebugExpression.cs#L213)
+  的 `SetValueAsString` / `SetValueAsReference` 永远返回 `E_NOTIMPL`，监视
+  窗无法修改变量。
+- **数据断点 / 观察点**：[BreakpointsProcessor::setSource](lldb/tools/lldb-mixdev/DebugHostServices.cpp#L138)
+  是断点协议的唯一入口。`eStopReasonWatchpoint` 在
+  [LldbBackend.cpp:163](lldb/tools/lldb-mixdev/LldbBackend.cpp#L163) 列出但
+  **没有任何 SET 路径**，对应
+  [MixDebugExpression.cs:226](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixDebugExpression.cs#L226)
+  `CreateDataBreakpoint` 永远 `E_NOTIMPL`。
+- **函数断点 / 异常断点 / 条件断点 / Hit Count / 日志断点**：grep 全项目 0 处
+  `condition`、`hitCondition`、`logMessage`、`exceptionBreakpoint`、
+  `functionBreakpoint`。VS 侧虽有 `MixDebugBreakpoint`，但 protocol payload
+  不携带这些字段，C++ 端也未消费。
+- **Set Next Statement / Goto**：
+  [MixDebugThread.cs:64](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixDebugThread.cs#L64)
+  `E_NOTIMPL`，C++ 端也无 `goto`/`jump` 处理器。
+
+#### 28.1.2 LldbBackend.cpp — VariableRef 句柄无 invalidate（资源泄漏 + 陈旧句柄风险）
+
+[LldbBackend.cpp:1711-1716](lldb/tools/lldb-mixdev/LldbBackend.cpp#L1711-L1716)
+`addVariableRef` 单调递增写入 `Session::VariableRefs`，**任何 stop / step /
+continue 都不清空**（`grep VariableRefs.*clear` 无命中）。后果：
+
+- 长会话内存增长（每次展开作用域追加 `SBValue` 副本）；
+- 旧句柄在新一轮停止后仍可被 client 误用，可能返回上一停止点的陈旧子树。
+
+DAP 语义要求 stop 时使旧 `variablesReference` 失效。建议在 step / continue
+/ process state change 时执行：
+
+```cpp
+S.VariableRefs.clear();
+S.NextVariableRef = 1;
+```
+
+#### 28.1.3 LldbBackend.cpp — 模块清单被截断到 16
+
+[LldbBackend.cpp:535](lldb/tools/lldb-mixdev/LldbBackend.cpp#L535)
+`const uint32_t Limit = std::min<uint32_t>(Count, 16);` 硬封顶 16 个模块。
+iOS app 通常加载 60+ 系统库，模块窗口/模块诊断会丢大半，影响符号源诊断和
+断点定位。
+
+#### 28.1.4 LldbBackend.cpp — 模块体积始终为 0
+
+[LldbBackend.cpp:518](lldb/tools/lldb-mixdev/LldbBackend.cpp#L518)
+`D["size"] = Object(static_cast<uint64_t>(0));`。VS 模块面板的 Size 列恒为 0；
+这是 `moduleToObject` 中唯一一项空占位。需要遍历 `SBSection` 累加。
+
+#### 28.1.5 LldbBackend.cpp — symbolMismatchReason 永远空字符串
+
+[LldbBackend.cpp:510](lldb/tools/lldb-mixdev/LldbBackend.cpp#L510)
+`D["symbolMismatchReason"] = Object("");` 是字面占位 — UUID 不匹配、路径不
+一致这类常见原因都不会上报，符号告警面板形同虚设。
+
+### 28.2 中优先级 — 流程/异常路径
+
+#### 28.2.1 Main.cpp — Session 错误退出无清理
+
+[Main.cpp](lldb/tools/lldb-mixdev/Main.cpp) `serveOne` 出错直接 `return 1`，
+未通知 `LldbBackend` 关闭活跃 SBProcess / detach。设备侧进程会被遗留为
+stopped 状态，下次 attach 会撞 `Already attached`。
+
+#### 28.2.2 MixDebugThread.cs — IDebugProperty2 大量赋值/获取拒绝
+
+[MixDebugThread.cs:399,417,423,426,427,434](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixDebugThread.cs#L399)
+一系列 `IDebugProperty2` 成员 `E_NOTIMPL`：`GetMemoryBytes`、`GetReference`、
+`GetExtendedInfo`、`SetValueAs*`、`CreateObjectID`。直接结果是 Watch 面板
+只能看不能写、不能 pin、不能 raw memory view。
+
+#### 28.2.3 DTX 协议解析容错
+
+- [AuxList.cs:102-103](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/Protocol/Dtx/AuxList.cs#L102)
+  对未知 `typeTag` 直接抛 `DtxException` — 后端如果新增类型，client 会硬掉
+  而非降级。
+- `Protocol.cs` 的 `MessageHeader.Decode` / `PayloadHeader.Decode` 只做 magic
+  + 长度校验，未见多 fragment 重组路径；`FragmentCount > 1` 分支的真正实现
+  需在
+  [Connection.cs](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/Protocol/Dtx/Connection.cs)
+  中复核是否覆盖。
+
+#### 28.2.4 MixDebugModule.cs — 不支持手动 reload symbol
+
+[MixDebugModule.cs:106](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixDebugModule.cs#L106)
+`ReloadSymbols` 返回 `E_NOTIMPL`，注释 "Mix Debug Engine does not support
+manual symbol reload yet"。新建 dSYM 后必须重新启动调试会话，开发反馈循环慢。
+
+### 28.3 低优先级 — 噪声 / 可维护性
+
+- [MixDebugThread.cs:55,72-82,126](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixDebugThread.cs#L55)
+  `SetThreadName` / `Suspend` / `Resume` / `GetLogicalThread` 全部 `E_NOTIMPL`：
+  iOS 远程调试基本用不到，按现状即可。
+- [MixCoreServer.cs:104-109](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixCoreServer.cs#L104-L109)、
+  [MixProgramProvider.cs:22](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixProgramProvider.cs#L22)：
+  legacy DCOM 路径，注释已说明 unsupported，无影响。
+- [MixDebugProgram.cs:142-143,155-156](../../Users/Station/Desktop/IrisBuild/src/ycode/debugger/VSDebugger/DebugBridge/MixDebugProgram.cs#L142)：
+  ENC 与 WriteDump，iOS 原生本来不支持，不算缺口。
+- `Screenshotter.cs:45`、`MixDeviceLogger.cs:45,87`：`catch {}` 吞异常（仅
+  Dispose 路径，可接受但建议至少 log）。
+- `MixDebugBreakpoint.cs:179` 用魔数 `(int)_state.state == 3` 判 enabled，建议
+  改枚举常量。
+- `MixDebugLauncher.cs:340,351`、`AsyncQuery.cs:40` 失败路径返回 `null`/空集
+  且无日志，诊断困难。
+
+### 28.4 lldb-mixdev 协议表面 vs 已暴露能力对照表
+
+| 协议端点 | C++ 后端 | C# 前端 | 影响 |
+|---|---|---|---|
+| writeMemory | ❌ 缺失 | E_NOTIMPL | Memory 视图只读 |
+| setVariable / setExpression | ❌ 缺失 | E_NOTIMPL | Watch 不可编辑 |
+| setDataBreakpoints / Watchpoint | ❌ 仅 stop reason | E_NOTIMPL | 数据断点不可用 |
+| setFunctionBreakpoints | ❌ 缺失 | — | 函数断点不可用 |
+| setExceptionBreakpoints | ❌ 缺失 | — | 异常断点不可用 |
+| 条件 / Hit / Log 断点 | ❌ payload 无字段 | — | 高级断点不可用 |
+| goto / jump | ❌ 缺失 | E_NOTIMPL | Set Next Statement 不可用 |
+| reloadSymbols | ❌ 缺失 | E_NOTIMPL | 符号需重启会话 |
+| 模块 size / symbolMismatchReason | ⚠️ 占位 0 / "" | — | 模块面板信息缺失 |
+| 模块清单上限 | ⚠️ 截断到 16 | — | iOS 应用模块大半丢失 |
+| VariableRefs invalidate | ❌ 不清空 | — | 内存泄漏 + 陈旧句柄 |
+
+### 28.5 建议落地优先级
+
+1. **写内存 + 写变量 + Watchpoint 三个协议端点** — VS 调试器对原生进程的硬刚
+   需，目前 C++ 后端根本没暴露。
+2. **`VariableRefs` 在每次 `process state→stopped` 时清空** — 不需要新协议、
+   几行代码、修内存泄漏 + 防陈旧句柄。
+3. **去掉模块 16 上限 + 填 size + 填 symbolMismatchReason**。
+4. **条件 / Hit-count / 日志断点** — 在现有 `setSourceBreakpoints` payload 上
+   加字段而不是新加端点，改动最小。
+5. **DTX 多碎片消息接收路径**走查 `Connection.cs`，确认重组真的有实现。

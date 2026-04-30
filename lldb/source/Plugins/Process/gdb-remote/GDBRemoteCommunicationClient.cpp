@@ -785,10 +785,11 @@ lldb::pid_t GDBRemoteCommunicationClient::GetCurrentProcessID(bool allow_lazy) {
         if (response.GetChar() == 'C') {
           m_curr_pid_run = m_curr_pid =
               response.GetHexMaxU64(false, LLDB_INVALID_PROCESS_ID);
-          if (m_curr_pid != LLDB_INVALID_PROCESS_ID) {
+          if (m_curr_pid != LLDB_INVALID_PROCESS_ID && m_curr_pid != 0) {
             m_curr_pid_is_valid = eLazyBoolYes;
             return m_curr_pid;
           }
+          m_curr_pid_run = m_curr_pid = LLDB_INVALID_PROCESS_ID;
         }
       }
     }

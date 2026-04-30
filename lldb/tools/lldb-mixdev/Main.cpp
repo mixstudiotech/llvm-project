@@ -10,6 +10,9 @@
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <memory>
+#include <mutex>
+
 namespace {
 
 llvm::cl::OptionCategory YCodeDebugHostCategory("YCode DebugHost options");
@@ -47,6 +50,33 @@ int runTcpServer() {
     }
 
     llvm::dtx::ServerSession Session(*Transport.get());
+    struct EventSinkContext {
+      llvm::dtx::ServerSession *Session = nullptr;
+      std::mutex Mutex;
+      bool Active = true;
+    };
+    auto SinkContext = std::make_shared<EventSinkContext>();
+    SinkContext->Session = &Session;
+    Services.setEventSink([SinkContext](const llvm::dtx::ns::Object &Event) {
+      std::lock_guard<std::mutex> Lock(SinkContext->Mutex);
+      if (!SinkContext->Active || !SinkContext->Session)
+        return;
+      llvm::dtx::Error Err = SinkContext->Session->sendObject(0, Event);
+      if (Err)
+        llvm::errs() << Err.message() << "\n";
+    });
+    struct EventSinkReset {
+      ycode::debughost::DebugHostServices &Services;
+      std::shared_ptr<EventSinkContext> Context;
+      ~EventSinkReset() {
+        {
+          std::lock_guard<std::mutex> Lock(Context->Mutex);
+          Context->Active = false;
+          Context->Session = nullptr;
+        }
+        Services.setEventSink(nullptr);
+      }
+    } Reset{Services, SinkContext};
     do {
       llvm::dtx::Error Err = Session.serveOne(
           [&](uint32_t Channel, const std::string &Selector,

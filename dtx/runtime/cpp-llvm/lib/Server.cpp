@@ -20,6 +20,17 @@ Error ServerSession::writeAll(const std::vector<uint8_t> &Bytes) {
   return Transport_.write(Bytes.data(), Bytes.size());
 }
 
+Error ServerSession::sendObject(uint32_t Channel, const ns::Object &Object,
+                                PayloadFlag Flag) {
+  std::lock_guard<std::mutex> Lock(WriteMutex_);
+  std::vector<uint8_t> Payload = buildObjectPayload(Object, Flag);
+  Fragment Message{MessageHeader::build(Channel,
+                                        static_cast<uint32_t>(Payload.size()),
+                                        ++NextOutboundMessageId_, 0, false),
+                   Payload};
+  return writeAll(Message.encode());
+}
+
 Error ServerSession::serveOne(const ServerDispatch &Dispatch) {
   auto HeaderBytes = readExact(MessageHeaderLength);
   if (!HeaderBytes)
@@ -49,6 +60,7 @@ Error ServerSession::serveOne(const ServerDispatch &Dispatch) {
                                       Header.get().ConversationIndex + 1,
                                       false),
                  ReplyPayload};
+  std::lock_guard<std::mutex> Lock(WriteMutex_);
   return writeAll(Reply.encode());
 }
 
