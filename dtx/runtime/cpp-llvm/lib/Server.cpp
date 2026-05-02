@@ -31,7 +31,7 @@ Error ServerSession::sendObject(uint32_t Channel, const ns::Object &Object,
   return writeAll(Message.encode());
 }
 
-Error ServerSession::serveOne(const ServerDispatch &Dispatch) {
+Expected<ServerRequest> ServerSession::readRequest() {
   auto HeaderBytes = readExact(MessageHeaderLength);
   if (!HeaderBytes)
     return HeaderBytes.error();
@@ -45,23 +45,42 @@ Error ServerSession::serveOne(const ServerDispatch &Dispatch) {
   if (!Selector)
     return Selector.error();
 
-  auto ReplyObject =
-      Dispatch(Header.get().ChannelCode, Selector.get().Selector, Selector.get().Args);
+  ServerRequest Req;
+  Req.ChannelCode = Header.get().ChannelCode;
+  Req.MessageId = Header.get().MessageId;
+  Req.ConversationIndex = Header.get().ConversationIndex;
+  Req.ExpectsReply = Header.get().ExpectsReply != 0;
+  Req.Selector = std::move(Selector.get().Selector);
+  Req.Args = std::move(Selector.get().Args);
+  return Req;
+}
+
+Error ServerSession::sendReply(const ServerRequest &Request,
+                               const ns::Object &Reply) {
+  if (!Request.ExpectsReply)
+    return Error::success();
+  std::vector<uint8_t> ReplyPayload =
+      buildObjectPayload(Reply, PayloadFlag::Reply);
+  Fragment ReplyFrag{
+      MessageHeader::build(Request.ChannelCode,
+                           static_cast<uint32_t>(ReplyPayload.size()),
+                           Request.MessageId, Request.ConversationIndex + 1,
+                           false),
+      ReplyPayload};
+  std::lock_guard<std::mutex> Lock(WriteMutex_);
+  return writeAll(ReplyFrag.encode());
+}
+
+Error ServerSession::serveOne(const ServerDispatch &Dispatch) {
+  auto Req = readRequest();
+  if (!Req)
+    return Req.error();
+
+  auto ReplyObject = Dispatch(Req.get().ChannelCode, Req.get().Selector,
+                              Req.get().Args);
   if (!ReplyObject)
     return ReplyObject.error();
-  if (Header.get().ExpectsReply == 0)
-    return Error::success();
-
-  std::vector<uint8_t> ReplyPayload =
-      buildObjectPayload(ReplyObject.get(), PayloadFlag::Reply);
-  Fragment Reply{MessageHeader::build(Header.get().ChannelCode,
-                                      static_cast<uint32_t>(ReplyPayload.size()),
-                                      Header.get().MessageId,
-                                      Header.get().ConversationIndex + 1,
-                                      false),
-                 ReplyPayload};
-  std::lock_guard<std::mutex> Lock(WriteMutex_);
-  return writeAll(Reply.encode());
+  return sendReply(Req.get(), ReplyObject.get());
 }
 
 } // namespace llvm::dtx

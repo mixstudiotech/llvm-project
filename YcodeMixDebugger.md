@@ -4,23 +4,24 @@
 
 YCode Mobile Debugger 的目标是在 Windows 上为 Visual Studio 提供 iOS / Android 原生远程调试能力，覆盖安装、启动、Attach、断点、线程、调用栈、变量、表达式求值、内存查看、内存断点、符号管理以及性能分析联动。
 
-## 0. 当前实施路线更新（2026-04-30）
+## 0. 当前实施路线更新（2026-05-02）
 
-Visual Studio 插件当前继续沿用已经落地的旧 MIEngine 路线，不在本阶段切换到
-自研 AD7 Debug Engine；但实现顺序调整为先把 `llvm-project/dtx` 的 runtime
-与 codegen 打底，方便 DebugHost 与后续 IDE 接入一气呵成。VSIX 在 DebugHost
-可用前仍走旧桥接路径：
+Visual Studio 插件当前路线已经切到自研 AD7 Debug Engine，不再以 MIEngine /
+lldb-mi 作为主调试链路。`src/ycode/debugger/VSDebugger` 负责 VS AD7 对象、
+事件和调试窗口集成；`YCode.DebugHost.exe` 负责进程外 LLDB SB API、设备连接、
+符号和 DebugHost 协议。后续开发重点是把 AD7 所需的对象生命周期和事件语义补齐，
+而不是恢复旧 MIEngine 桥接。
 
 ```text
 Visual Studio
   ↓
-YCode / Mix VSIX
+YCode / Mix VSIX + MixDebugEngine (AD7)
   ↓
-MIEngine + lldb-mi
+DTX request/reply + async event
   ↓
-DebugServerForwarder (loopback TCP)
+YCode.DebugHost.exe
   ↓
-mixdevice FFI
+LLDB SB API + mixdevice FFI
   ↓
 iOS debugserver / Android lldb-server
 ```
@@ -28,16 +29,16 @@ iOS debugserver / Android lldb-server
 当前阶段的工程目标：
 
 ```text
-1. 保留 MIEngine 承担 VS 调试窗口、断点、线程、调用栈、变量和表达式集成。
+1. `MixDebugEngine` 承担 VS 调试窗口、断点、线程、调用栈、变量和表达式集成。
 2. VSIX 继续负责设备列表、启动 / Attach UI、符号路径传递、日志和屏幕工具窗口。
-3. DebugServerForwarder 继续把 MIEngine/lldb-mi 的本地 TCP 连接转发到设备调试服务。
-4. 优先补齐项目系统 F5 启动、Attach-to-Process 下拉双击 attach、符号路径自动发现和连接诊断。
-5. DTX / DebugHost / YDP 先作为底层基础设施推进；VSIX 切换到它们之前仍保留 MIEngine 旧路径。
+3. DebugHost 继续承载 LLDB、设备调试服务连接、符号加载和异步事件。
+4. 优先补齐 AD7 事件闭环、breakpoint hit 精确映射、变量/内存写入和异常/信号处理。
+5. DTX / DebugHost / YDP 作为 IDE 与 DebugHost 的统一边界，未来可复用到其它 IDE。
 ```
 
-因此，当前执行策略是：先实现 DTX runtime + schema + codegen，再实现
-DebugHost 服务，最后让 VS 插件从 MIEngine 桥接逐步迁移。当前可交付 VSIX 仍以
-MIEngine 方案为准。
+因此，当前执行策略是：保留已有 DTX runtime + codegen，继续增强
+`DebugHostCore.td` 和 `lldb/tools/lldb-mixdev` 后端能力；VS 侧通过
+`MixDebugEngine` 逐步补齐 AD7 完整映射。
 
 > 2026-04-30 DebugHost 实现更新：`YCode.DebugHost.exe` 的实现入口已落到
 > `lldb/tools/lldb-mixdev`，作为 LLDB 工具树里的独立 host executable 构建。
@@ -2385,12 +2386,14 @@ src/ycode/debugger/VSDebugger/
   Protocol/DebugHostClientSession.cs
                                  # 启动 YCode.DebugHost.exe --print-port，
                                  # 建立 DTX TCP 连接并调用 initialize / device.prepareDebug
+                                 # / session / execution / threads / variables / modules
   DebugBridge/MixDebugLauncher.cs
-                                 # Launch / Attach 进入旧 MIEngine 前先通过 DebugHost
-                                 # 做 device.prepareDebug；优先把返回的 connectUrl
-                                 # 写入 MIEngine 的 miDebuggerServerAddress。
-                                 # 如果 connectUrl 缺失，则回退到现有
-                                 # DebugServerForwarder + loopback TCP 路线。
+                                 # DebugHost session helper，由 MixDebugEngine
+                                 # 在 AD7 Attach / Launch 生命周期中调用。
+  DebugBridge/MixDebugEngine.cs
+                                 # 自研 AD7 Debug Engine，负责 Program/Thread/
+                                 # StackFrame/Module/Breakpoint/Property/Memory
+                                 # 等 VS 调试对象。
 ```
 
 `YCode.DebugHost.exe` 解析顺序为：
@@ -2406,10 +2409,41 @@ VSIX 构建时会在 `dtx-codegen.exe` 和 `DebugHostCore.td` 可用时重新生
 `debugger_mix_device.xml` 打进 VSIX。`DebugHostClientSession` 现在由
 `DebugSessionHandle` 保活，避免 `device.prepareDebug` 完成立刻 shutdown host。
 
-因此当前阶段已经把 VS 插件接到 DebugHost 协议上，并让 DebugHost 产出的
-`connectUrl` 进入 MIEngine 连接配置；但实际 VS 调试窗口、断点、线程和变量显示
-仍由旧 MIEngine 承担。后续 AD7 迁移时再把 `session.*`、`execution.*`、threads、
-variables、events 等服务逐步从 MIEngine 搬到 DebugHost。
+因此当前阶段已经把 VS 插件的主调试路径接到 `MixDebugEngine + DebugHost`
+协议上。实际 VS 调试窗口、断点、线程、调用栈、变量、模块、内存、寄存器和
+反汇编由 AD7 对象承接，后续工作是补齐完整事件、对象 handle、写能力和异常/
+断点高级能力。
+
+#### 24.3.1 Debug-gauge tool windows
+
+VSIX 在 2026-05-02 增加了 Memory / GPU / Energy 三个 debug-gauge tool
+window，复刻 Xcode Debug Navigator 的 Memory Report、GPU Report、Energy
+Report：
+
+```text
+src/ycode/debugger/VSDebugger/ToolWindows/
+  Charts/HalfGauge.cs        # 半圆速度表，支持自定义 ColorStops（Energy 用）
+  Charts/UsageDonut.cs       # 三段甜甜圈 + 右侧 legend
+  Charts/BarSeries.cs        # 既能画 timeline，也能画分组 bar（GPU）
+  Charts/IndicatorTrack.cs   # Energy 报告底部的多行布尔指示
+  MemoryReportControl.xaml   # Memory Use 半圆 + Usage Comparison 甜甜圈 + timeline
+  GpuReportControl.xaml      # FPS 半圆 + Utilization bars + Frame Time bars
+  EnergyReportControl.xaml   # 4 段 Utilization 半圆 + Wakes/CPU + Energy Impact
+```
+
+入口走 Tools → Mix Debugger 子菜单（Memory Report、GPU Report、Energy
+Report），命令在 [MixDebuggerPackage.vsct](../src/ycode/debugger/VSDebugger/MixDebuggerPackage.vsct)
+注册。三个 view-model 的 `OnSampleAsync()` 当前返回占位采样（mix_device
+还没暴露 sysmontap / GPU Instruments / energy gauge 的 FFI），但 UI 已经完
+全可视，可以作为 binding/接线层直接对接将来加进 DebugHost 的 `gauges.*`
+RPC 或者 mix_device 上的 Instruments FFI。
+
+约束：
+
+- 不要让 VSIX 直接持有第二条设备级 Instruments 长连接；DebugHost 已经持
+  有 device-level cached `mix_instruments_t`，新数据应通过 DebugHost 走。
+- 真实数据接入时，view-model 在 attach/launch 完成后跟随 active session，
+  替换默认的 `DeviceHandle.ListAll()[0]` 占位绑定。
 
 ### 24.4 其它 IDE 插件
 
@@ -2733,3 +2767,210 @@ manual symbol reload yet"。新建 dSYM 后必须重新启动调试会话，开�
 4. **条件 / Hit-count / 日志断点** — 在现有 `setSourceBreakpoints` payload 上
    加字段而不是新加端点，改动最小。
 5. **DTX 多碎片消息接收路径**走查 `Connection.cs`，确认重组真的有实现。
+
+## 29. AD7 完整映射缺口与 DebugHost 开发计划（2026-05-02）
+
+本节覆盖 2026-05-02 的最新路线：VS 侧已经走自研 `MixDebugEngine` AD7 路径，
+DebugHost 已经有 `modules.reloadSymbols`、模块 size/symbolMismatchReason、
+`VariableRefs` invalidate、DebugHost async event sink 等实现痕迹。因此上一节
+28 中关于这些条目的旧结论只作为历史审计参考，后续以本节为准。
+
+### 29.1 当前模型判断
+
+当前 DebugHost 协议仍是 DAP 风格的粗粒度服务：
+
+```text
+Lifecycle / Session / Execution / Breakpoints / Threads / Expressions /
+Memory / Modules / Device / DeviceSymbols
+```
+
+这能覆盖基础调试主流程，但 AD7 是 COM 对象模型。要“完整接住 AD7”，需要让
+DebugHost 能稳定支撑下列 VS 对象生命周期：
+
+```text
+IDebugProgram2              -> session/process
+IDebugThread2               -> thread id + stopped generation
+IDebugStackFrame2           -> frame id + stopped generation
+IDebugProperty2             -> value id / variablesReference + generation
+IDebugModule2/3             -> module id / uuid / symbol status
+IDebugPendingBreakpoint2    -> client breakpoint id
+IDebugBoundBreakpoint2      -> backend breakpoint id + location id
+IDebugCodeContext2          -> address/source location
+IDebugDocumentContext2      -> local source path + range
+IDebugMemoryBytes2          -> process memory reader/writer
+IDebugDisassemblyStream2    -> address-range instruction stream
+```
+
+不建议把 DebugHost 改成完整 AGDE gRPC SBAPI 复刻。更合适的模型是：保留
+DTX/DAP 主服务，给 AD7 难以表达的对象补 handle 和 generation。
+
+### 29.2 还缺的 DebugHost 能力
+
+| 能力 | 当前情况 | 需要新增 |
+| --- | --- | --- |
+| 进程生命周期 | launch/attach/continue/pause/step 已有 | `detach`、`terminate/kill`、`restart`、DebugHost 异常退出时自动 detach |
+| 停止/运行事件 | 已有 `stopped`/moduleLoaded 等初步 event sink | `continued`、thread create/destroy、module unload、breakpoint hit、exception/signal、symbolsChanged |
+| breakpoint 命中 | source breakpoint 可 bind | backend breakpoint id/location id 回传；VS bound breakpoint 精确匹配 |
+| 高级断点 | source replace 语义已有 | address/function/data/watchpoint/exception breakpoint |
+| 断点条件 | VS 侧能保存 condition/pass count | DebugHost payload 和 LLDB breakpoint condition/ignore count/log callback |
+| 变量 | scopes/variables/evaluate 已有 | `variables.set`、`expressions.assign`、value handle、memoryReference、format/radix |
+| 内存 | `memory.read` 已有 | `memory.write`、memory region/protection 查询 |
+| 寄存器 | `threads.registers` 已有 | `registers.write`、寄存器组/格式语义 |
+| 反汇编 | `memory.disassemble` 已有 | source mixed mode、instruction bytes、symbol label、function boundary |
+| 模块/符号 | modules/reloadSymbols 已有 | module unload event、symbols.lookup/index、symbol status changed event |
+| 异常/信号 | stop reason 可见 | exception policy、signal pass/stop/notify、AD7 exception event payload |
+| 对象生命周期 | `VariableRefs` 已有 invalidate | `StopGeneration` 覆盖 frame/value/code-context；resume 后旧 handle 返回 stale-object |
+
+### 29.3 `DebugHostCore.td` 建议扩展
+
+第一批扩展直接服务 AD7 完整映射：
+
+```text
+Execution:
+  detach(request) -> DetachResult
+  terminate(request) -> TerminateResult
+  setNextStatement(request) -> SetNextStatementResult
+
+Breakpoints:
+  setAddress(request) -> SetAddressBreakpointsResult
+  setFunction(request) -> SetFunctionBreakpointsResult
+  setData(request) -> SetDataBreakpointsResult
+  setException(request) -> SetExceptionBreakpointsResult
+  update(request) -> UpdateBreakpointsResult
+
+Threads:
+  select(request) -> SelectThreadResult
+  frames(request) -> FramesResult              # frame handle + generation
+
+Variables:
+  get(request) -> VariableResult               # value handle
+  children(request) -> VariablesResult
+  set(request) -> SetVariableResult
+
+Memory:
+  write(request) -> WriteMemoryResult
+  regions(request) -> MemoryRegionsResult
+
+Registers:
+  write(request) -> WriteRegisterResult
+
+Symbols:
+  lookup(request) -> SymbolsLookupResult
+  setSourceMap(request) -> SetSourceMapResult
+
+Sources:
+  loaded(request) -> LoadedSourcesResult
+```
+
+事件 payload 建议统一为：
+
+```text
+DebugHostEvent {
+  eventName
+  sessionId
+  processId
+  threadId
+  stopId
+  generation
+  reason
+  breakpointId
+  breakpointLocationId
+  module
+  exceptionName
+  exceptionCode
+  message
+}
+```
+
+### 29.4 DebugHost 后端实现顺序
+
+1. **事件标准化**
+   - 在 `LldbBackend` event pump 中输出 typed `stopped`、`continued`、`exited`、
+     `threadCreated`、`threadDestroyed`、`moduleLoaded`、`moduleUnloaded`。
+   - `stopped` 必须携带 `reason/threadId/stopId/generation`。
+
+2. **Breakpoint store**
+   - 在 `Session` 中保存 client breakpoint id 到 LLDB breakpoint/location id 的映射。
+   - source/address/function/data/exception breakpoint 都走统一 backend id。
+   - 命中事件回传 backend id，VS 侧才能发送正确 `IDebugBreakpointEvent2`。
+
+3. **Stopped generation**
+   - 每次 process state 进入 stopped 时递增 generation。
+   - frame/value/code context handle 带 generation。
+   - continue/step/resume 后旧 handle 查询返回 `staleObject`。
+
+4. **写能力**
+   - `memory.write` -> `SBProcess::WriteMemory`。
+   - `variables.set` / `expressions.assign` -> `SBValue::SetValueFromCString` 或 frame expression assignment。
+   - `registers.write` -> LLDB register value write path。
+
+5. **符号能力**
+   - `symbols.lookup` 用 Mach-O UUID / ELF Build ID 查询本地 index。
+   - `reloadSymbols` 成功后发 `symbolsChanged`，Modules UI 不靠重新 attach 更新。
+
+6. **异常和信号**
+   - 暴露 LLDB UnixSignals/exception policy。
+   - VS `SetException` / `RemoveSetException` 不再只是 stub。
+
+### 29.5 VS AD7 侧实现顺序
+
+1. **事件 parser**
+   - `DebugHostEventInfo` 从弱字符串解析升级为 typed payload。
+   - `MixDebugEngine.OnDebugHostEvent` 精确映射：
+     - breakpoint -> `IDebugBreakpointEvent2`
+     - step -> `IDebugStepCompleteEvent2`
+     - pause/signal -> `IDebugBreakEvent2` 或 `IDebugExceptionEvent2`
+     - continued -> running 状态同步
+     - module unload -> `IDebugModuleLoadEvent2(load=0)`
+
+2. **Breakpoint 对象**
+   - `MixPendingBreakpoint` 下发 condition/pass count/log message。
+   - `MixBoundBreakpoint` 保存 backend id/location id。
+   - 增加 address/function/data/exception breakpoint 请求解析。
+
+3. **Property 对象**
+   - `SetValueAsString` 接 `variables.set`。
+   - `GetMemoryContext/GetMemoryBytes` 用 `LoadAddress/ByteSize` 返回可跳转 Memory。
+   - `GetDataBreakpointInfo` 返回真实地址和 size，打开 DataBP 前先做 capability gating。
+
+4. **Memory/Register/Disassembly**
+   - `MixDebugMemoryBytes.WriteAt` 接 `memory.write`。
+   - 寄存器 property 支持写入和 format/radix。
+   - `MixDebugDisassemblyStream` 补 source mixed mode 和 bytes。
+
+5. **Capabilities**
+   - `initialize` 返回 DebugHost capability。
+   - VS pkgdef metrics 只打开稳定能力；实验能力通过 UI 和 runtime 检查启用。
+
+### 29.6 验收矩阵
+
+```text
+Attach:
+  - attach 成功后 LoadComplete
+  - Break All 后 stopped event 驱动 VS 进入停止态
+  - Continue 后 continued event 驱动 VS 回到运行态
+
+Breakpoints:
+  - source breakpoint bind/hit/delete/disable/re-enable
+  - condition/pass count/log message 后端执行
+  - address/function/data/exception breakpoint capability-gated
+
+Stack/Variables:
+  - stopped 状态内 frame/value handle 稳定
+  - continue 后旧 handle 失效
+  - Watch 可改值，失败时错误可读
+
+Memory/Register/Disassembly:
+  - Memory read/write
+  - register read/write
+  - disassembly source mixed mode
+
+Modules/Symbols:
+  - module load/unload event
+  - reload symbols 后 Modules 窗口更新
+  - UUID/build-id mismatch 明确显示，不按文件名误绑定
+
+Lifecycle:
+  - detach/stop/target exit/device disconnect 都能清理 DebugHost
+  - VS 退出后无残留 YCode.DebugHost.exe
+```

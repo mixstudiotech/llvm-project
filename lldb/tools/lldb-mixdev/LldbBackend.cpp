@@ -1057,14 +1057,21 @@ void LldbBackend::startEventPump(Session &S) {
     Events->LastStopID = S.Process.GetStopID();
   }
 
-  // Cap LLDB's internal Halt timeout (default 20s) so the slow pause path
-  // can't outrun the C# client's 30s CTS. With this clamp the worst case
-  // is ~5s (SendAsyncInterrupt wait) + 8s (Halt) + 5s (post-stop wait) =
-  // 18s, leaving headroom for the client.
+  // Cap LLDB's internal Halt timeout (default 20s) so SBProcess::Stop, if it
+  // ever runs (e.g. evaluator-driven halts inside expression evaluation),
+  // can't blow past sane bounds. The `-t` form writes the *target-local*
+  // property — the global default doesn't propagate back into already-created
+  // targets, which is why the same command without `-t` was silently a no-op
+  // in the previous build.
   {
     lldb::SBCommandReturnObject Result;
     S.Debugger.GetCommandInterpreter().HandleCommand(
-        "settings set target.process.interrupt-timeout 8", Result);
+        "settings set -t target.process.interrupt-timeout 8", Result);
+    if (!Result.Succeeded()) {
+      llvm::errs() << "[lldb-mixdev] failed to clamp interrupt-timeout: "
+                   << (Result.GetError() ? Result.GetError() : "<no error>")
+                   << "\n";
+    }
   }
 
   // Subscribe broadly so dyld module-load notifications and thread-state
@@ -1542,9 +1549,11 @@ Object LldbBackend::continueExecution(const Object &Request) {
       *S, BaselineGen, 1000, [](lldb::StateType State, uint32_t) {
         return State != lldb::eStateStopped && State != lldb::eStateCrashed;
       });
+  // Don't fabricate a Generation bump on timeout: just report the live
+  // GetState(). Bumping Generation here would falsely advance the
+  // event-generation counter and could spoof OTHER waiters' baselines into
+  // thinking a real event was consumed.
   lldb::StateType After = Wait.Observed ? Wait.State : S->Process.GetState();
-  if (!Wait.Observed)
-    updateSessionState(*S, After);
   Dict D;
   D["success"] = boolean(true);
   D["implemented"] = boolean(true);
@@ -1577,7 +1586,6 @@ Object LldbBackend::pause(const Object &Request) {
   // "the AsyncInterrupt path produced state X" from "we skipped that path
   // entirely because Before was already stopped".
   lldb::StateType AfterAsyncInterrupt = lldb::eStateInvalid;
-  lldb::StateType AfterStop = lldb::eStateInvalid;
   std::string StopMode = "already-stopped";
 
   auto isStoppedState = [](lldb::StateType State) {
@@ -1595,6 +1603,16 @@ Object LldbBackend::pause(const Object &Request) {
     // wait demands a freshly-consumed state-change event — otherwise a
     // stale LastState could spoof a "successful pause" without the
     // interrupt actually landing on the device.
+    //
+    // We deliberately do NOT fall back to SBProcess::Stop() (LLDB Halt) on
+    // timeout: it goes through the same gdb-remote channel as
+    // SendAsyncInterrupt and just adds another 8–20s of blocking via
+    // GetInterruptTimeout, which then starves the rest of the DTX session
+    // (single-threaded dispatcher in pre-fix builds; even with the
+    // multi-thread fix the C# CTS is 30s). If 5s of SendAsyncInterrupt
+    // didn't produce a stop, surface a fast failure so the client can
+    // decide whether to retry, log, or give up — no point burning more
+    // wall time on an unresponsive device.
     const uint64_t BaselineGen = snapshotEventGeneration(*S);
     S->Process.SendAsyncInterrupt();
     TransitionWaitResult Wait = waitForSessionTransition(
@@ -1606,39 +1624,12 @@ Object LldbBackend::pause(const Object &Request) {
     AfterAsyncInterrupt = After;
     StopMode = "async-interrupt";
   }
-  if (!WasStopped &&
-      (!isStoppedState(After) || S->Process.GetStopID() <= StopIDBefore)) {
-    // Same baseline trick around the slow Halt fallback. LLDB::Process::Halt
-    // re-broadcasts the stop event on success, so our pump will see a new
-    // generation; on failure we short-circuit via Error.Fail before the
-    // wait runs.
-    const uint64_t BaselineGen = snapshotEventGeneration(*S);
-    lldb::SBError Error = S->Process.Stop();
-    if (Error.Fail()) {
-      std::ostringstream Message;
-      Message << errorString(Error) << " before=" << stateName(Before)
-              << " afterAsyncInterrupt=" << stateName(AfterAsyncInterrupt)
-              << " current=" << stateName(S->Process.GetState())
-              << " threads=" << S->Process.GetNumThreads()
-              << " stopId=" << S->Process.GetStopID();
-      return makeFailure("execution", "pause", Message.str(), Request);
-    }
-    TransitionWaitResult Wait = waitForSessionTransition(
-        *S, BaselineGen, 5000, stoppedAfterCurrentRequest);
-    After = Wait.Observed ? Wait.State : S->Process.GetState();
-    ObservedStopTransition =
-        Wait.Observed || (isStoppedState(After) &&
-                          S->Process.GetStopID() > StopIDBefore);
-    AfterStop = After;
-    StopMode = "halt";
-  }
   if (!WasStopped && !ObservedStopTransition) {
     std::ostringstream Message;
-    Message << "pause did not observe a stop transition"
+    Message << "pause did not observe a stop transition within 5s"
             << " before=" << stateName(Before)
             << " after=" << stateName(After)
             << " afterAsyncInterrupt=" << stateName(AfterAsyncInterrupt)
-            << " afterStop=" << stateName(AfterStop)
             << " stopIdBefore=" << StopIDBefore
             << " stopIdAfter=" << S->Process.GetStopID()
             << " threads=" << S->Process.GetNumThreads();
@@ -1654,7 +1645,6 @@ Object LldbBackend::pause(const Object &Request) {
   D["stateBefore"] = Object(stateName(Before));
   D["stateAfter"] = Object(stateName(After));
   D["stateAfterAsyncInterrupt"] = Object(stateName(AfterAsyncInterrupt));
-  D["stateAfterStop"] = Object(stateName(AfterStop));
   D["stopIdBefore"] = Object(static_cast<uint64_t>(StopIDBefore));
   D["stopIdAfter"] = Object(static_cast<uint64_t>(S->Process.GetStopID()));
   if (!WasStopped && (After == lldb::eStateStopped ||
